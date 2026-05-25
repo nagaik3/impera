@@ -2,11 +2,32 @@ name: IMPERA — Automação Completa
 
 on:
   schedule:
-    - cron: '0 10 * * 1-6'      # Briefing 10h seg-sáb
-    - cron: '*/10 * * * 1-6'    # Auto Envio a cada 10min seg-sáb
-    - cron: '3 12 * * 0'        # Relatórios semanais domingo 12:03
-    - cron: '0 23 * * 0'        # Setorizados domingo 23:00
-    - cron: '7 9 1 * *'         # Mensais 1º do mês 09:07
+    # ========== DIÁRIAS ==========
+    - cron: '7 10 * * 1-6'      # Briefing 10h seg-sáb
+    - cron: '27 11 * * 1-6'     # ROAS Diário 11:27 seg-sáb
+    - cron: '0 10 * * 1-6'      # Rotina Diária (manhã) 10:00 seg-sáb
+    - cron: '10 22 * * 1-6'     # Rotina Diária (noite) 22:10 seg-sáb
+    - cron: '0 10 * * 1-6'      # Reminder Em Teste 10:00 seg-sáb
+
+    # ========== A CADA 10 MINUTOS ==========
+    - cron: '*/10 * * * 1-6'    # Auto Envio COPY → GT seg-sáb
+
+    # ========== A CADA 2 HORAS ==========
+    - cron: '0 */2 * * 1-6'     # Rastreador Esteira seg-sáb
+
+    # ========== A CADA 6 HORAS ==========
+    - cron: '7 */6 * * 1-6'     # Monitor Nichos/Ofertas seg-sáb
+
+    # ========== SEMANAIS ==========
+    - cron: '3 12 * * 0'        # Relatórios Semanais domingo 12:03
+    - cron: '15 10 * * 1'       # Relatórios Copywriters seg 10:15
+    - cron: '0 13 * * 0'        # Relatórios Entregas Tráfego dom 13:00
+    - cron: '0 10 * * 1'        # Solicitação Criativos seg 10:00
+    - cron: '0 23 * * 0'        # Relatórios Setorizados + GPDR Semanal dom 23:00
+    - cron: '15 13 * * 0'       # Pareto Semanal dom 13:15
+
+    # ========== MENSAIS ==========
+    - cron: '7 9 1 * *'         # Relatórios Mensais 1º 09:07
 
   workflow_dispatch:
     inputs:
@@ -18,10 +39,20 @@ on:
         options:
           - all
           - briefing
+          - roas
+          - rotina
+          - reminder
           - auto-envio
+          - rastreador
+          - monitor
           - semanal
+          - copywriters
+          - entregas
+          - solicitacao
           - setorizados
+          - pareto
           - mensal
+          - gate
 
 jobs:
   briefing:
@@ -151,7 +182,7 @@ jobs:
     if: |
       github.event_name == 'schedule' && github.event.schedule == '7 9 1 * *' ||
       github.event_name == 'workflow_dispatch' && (github.event.inputs.task == 'all' || github.event.inputs.task == 'mensal')
-    
+
     runs-on: ubuntu-latest
     name: 📅 Relatórios Mensais
 
@@ -174,3 +205,263 @@ jobs:
           CLICKUP_API_TOKEN: ${{ secrets.CLICKUP_API_TOKEN }}
           REDTRACK_API_KEY: ${{ secrets.REDTRACK_API_KEY }}
         run: python3 Scripts/relatorio_mensal_copywriters_clickup.py
+
+  roas:
+    if: |
+      github.event_name == 'schedule' && github.event.schedule == '27 11 * * 1-6' ||
+      github.event_name == 'workflow_dispatch' && (github.event.inputs.task == 'all' || github.event.inputs.task == 'roas')
+
+    runs-on: ubuntu-latest
+    name: 📊 ROAS Diário (11:27)
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Instalar dependências
+        run: pip install requests
+
+      - name: Executar ROAS Diário
+        env:
+          CLICKUP_API_TOKEN: ${{ secrets.CLICKUP_API_TOKEN }}
+          REDTRACK_API_KEY: ${{ secrets.REDTRACK_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python3 Scripts/roas_diario.py
+
+  rotina:
+    if: |
+      github.event_name == 'schedule' && (github.event.schedule == '0 10 * * 1-6' || github.event.schedule == '10 22 * * 1-6') ||
+      github.event_name == 'workflow_dispatch' && (github.event.inputs.task == 'all' || github.event.inputs.task == 'rotina')
+
+    runs-on: ubuntu-latest
+    name: 📅 Rotina Diária
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Instalar dependências
+        run: pip install requests
+
+      - name: Executar Rotina
+        env:
+          CLICKUP_API_TOKEN: ${{ secrets.CLICKUP_API_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python3 Scripts/rotina_diaria.py
+
+  reminder:
+    if: |
+      github.event_name == 'schedule' && github.event.schedule == '0 10 * * 1-6' ||
+      github.event_name == 'workflow_dispatch' && (github.event.inputs.task == 'all' || github.event.inputs.task == 'reminder')
+
+    runs-on: ubuntu-latest
+    name: ⏰ Reminder Em Teste (10:00)
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Instalar dependências
+        run: pip install requests
+
+      - name: Executar Reminder
+        env:
+          CLICKUP_API_TOKEN: ${{ secrets.CLICKUP_API_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python3 Scripts/reminder_em_teste.py
+
+  rastreador:
+    if: |
+      github.event_name == 'schedule' && github.event.schedule == '0 */2 * * 1-6' ||
+      github.event_name == 'workflow_dispatch' && (github.event.inputs.task == 'all' || github.event.inputs.task == 'rastreador')
+
+    runs-on: ubuntu-latest
+    name: 🔄 Rastreador Esteira (a cada 2h)
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Instalar dependências
+        run: pip install requests
+
+      - name: Rastrear Esteira
+        env:
+          CLICKUP_API_TOKEN: ${{ secrets.CLICKUP_API_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python3 Scripts/rastreador_esteira.py
+
+  monitor:
+    if: |
+      github.event_name == 'schedule' && github.event.schedule == '7 */6 * * 1-6' ||
+      github.event_name == 'workflow_dispatch' && (github.event.inputs.task == 'all' || github.event.inputs.task == 'monitor')
+
+    runs-on: ubuntu-latest
+    name: 📈 Monitor Nichos/Ofertas (a cada 6h)
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Instalar dependências
+        run: pip install requests
+
+      - name: Monitorar Nichos
+        env:
+          CLICKUP_API_TOKEN: ${{ secrets.CLICKUP_API_TOKEN }}
+          REDTRACK_API_KEY: ${{ secrets.REDTRACK_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python3 Scripts/monitor_nichos_ofertas.py
+
+  gate:
+    if: |
+      github.event_name == 'workflow_dispatch' && (github.event.inputs.task == 'all' || github.event.inputs.task == 'gate')
+
+    runs-on: ubuntu-latest
+    name: ✅ Gate Finalizado
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Instalar dependências
+        run: pip install requests python-docx
+
+      - name: Executar Gate
+        env:
+          CLICKUP_API_TOKEN: ${{ secrets.CLICKUP_API_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python3 Scripts/gate_finalizado.py
+
+  copywriters-semanal:
+    if: |
+      github.event_name == 'schedule' && github.event.schedule == '15 10 * * 1' ||
+      github.event_name == 'workflow_dispatch' && (github.event.inputs.task == 'all' || github.event.inputs.task == 'copywriters')
+
+    runs-on: ubuntu-latest
+    name: 📝 Relatório Copywriters Semanal (seg 10:15)
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Instalar dependências
+        run: pip install requests python-docx
+
+      - name: Gerar Relatório
+        env:
+          CLICKUP_API_TOKEN: ${{ secrets.CLICKUP_API_TOKEN }}
+          REDTRACK_API_KEY: ${{ secrets.REDTRACK_API_KEY }}
+        run: python3 Scripts/relatorio_copywriters_semanal.py
+
+  entregas-trafego:
+    if: |
+      github.event_name == 'schedule' && github.event.schedule == '0 13 * * 0' ||
+      github.event_name == 'workflow_dispatch' && (github.event.inputs.task == 'all' || github.event.inputs.task == 'entregas')
+
+    runs-on: ubuntu-latest
+    name: 🚚 Relatório Entregas Tráfego (dom 13:00)
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Instalar dependências
+        run: pip install requests python-docx
+
+      - name: Gerar Relatório
+        env:
+          CLICKUP_API_TOKEN: ${{ secrets.CLICKUP_API_TOKEN }}
+          REDTRACK_API_KEY: ${{ secrets.REDTRACK_API_KEY }}
+        run: python3 Scripts/relatorio_entregas_trafego.py
+
+  solicitacao-criativos:
+    if: |
+      github.event_name == 'schedule' && github.event.schedule == '0 10 * * 1' ||
+      github.event_name == 'workflow_dispatch' && (github.event.inputs.task == 'all' || github.event.inputs.task == 'solicitacao')
+
+    runs-on: ubuntu-latest
+    name: 📋 Solicitação Criativos (seg 10:00)
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Instalar dependências
+        run: pip install requests python-docx
+
+      - name: Gerar Relatório
+        env:
+          CLICKUP_API_TOKEN: ${{ secrets.CLICKUP_API_TOKEN }}
+          REDTRACK_API_KEY: ${{ secrets.REDTRACK_API_KEY }}
+        run: python3 Scripts/relatorio_solicitacao_criativos_semanal.py
+
+  gpdr-semanal:
+    if: |
+      github.event_name == 'schedule' && github.event.schedule == '0 23 * * 0' ||
+      github.event_name == 'workflow_dispatch' && (github.event.inputs.task == 'all' || github.event.inputs.task == 'setorizados')
+
+    runs-on: ubuntu-latest
+    name: 📊 GPDR Semanal (dom 23:00)
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Instalar dependências
+        run: pip install requests python-docx
+
+      - name: Gerar GPDR Semanal
+        env:
+          CLICKUP_API_TOKEN: ${{ secrets.CLICKUP_API_TOKEN }}
+          REDTRACK_API_KEY: ${{ secrets.REDTRACK_API_KEY }}
+        run: python3 Scripts/relatorio_gpdr_semanal.py
+
+  pareto-semanal:
+    if: |
+      github.event_name == 'schedule' && github.event.schedule == '15 13 * * 0' ||
+      github.event_name == 'workflow_dispatch' && (github.event.inputs.task == 'all' || github.event.inputs.task == 'pareto')
+
+    runs-on: ubuntu-latest
+    name: 🏆 Pareto Semanal (dom 13:15)
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Instalar dependências
+        run: pip install requests python-docx
+
+      - name: Gerar Pareto
+        env:
+          CLICKUP_API_TOKEN: ${{ secrets.CLICKUP_API_TOKEN }}
+          REDTRACK_API_KEY: ${{ secrets.REDTRACK_API_KEY }}
+        run: python3 Scripts/pareto_semanal.py
