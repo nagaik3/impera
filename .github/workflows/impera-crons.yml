@@ -15,6 +15,7 @@ on:
 
     # ========== A CADA 2 HORAS ==========
     - cron: '0 */2 * * 1-6'     # Rastreador Esteira seg-sáb
+    - cron: '5 */2 * * 1-6'     # Auto Etiqueta (offset) seg-sáb
 
     # ========== A CADA 6 HORAS ==========
     - cron: '7 */6 * * 1-6'     # Monitor Nichos/Ofertas seg-sáb
@@ -426,3 +427,25 @@ jobs:
           CLICKUP_API_TOKEN: ${{ secrets.CLICKUP_API_TOKEN }}
           REDTRACK_API_KEY: ${{ secrets.REDTRACK_API_KEY }}
         run: python3 Scripts/pareto_semanal.py
+
+  auto-etiqueta:
+    if: |
+      github.event_name == 'schedule' && github.event.schedule == '5 */2 * * 1-6' ||
+      github.event_name == 'workflow_dispatch' && (github.event.inputs.task == 'all' || github.event.inputs.task == 'auto-etiqueta')
+
+    runs-on: ubuntu-latest
+    name: 🏷️ Auto Etiqueta (a cada 2h)
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Instalar dependências
+        run: pip install requests
+
+      - name: Aplicar Tags
+        env:
+          CLICKUP_API_TOKEN: ${{ secrets.CLICKUP_API_TOKEN }}
+        run: python3 Scripts/auto_etiqueta.py
