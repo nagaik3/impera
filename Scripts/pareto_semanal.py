@@ -14,7 +14,7 @@ from datetime import datetime, timedelta
 
 REDTRACK_KEY = os.environ.get("REDTRACK_API_KEY", "")
 CLICKUP_TOKEN = os.environ.get("CLICKUP_API_TOKEN", "")
-CHAT_VIEW_ID = "6-901324476398-8"  # GT Chat View
+CHAT_VIEW_ID = "8cm1w4b-9913"  # Main Chat View para briefings
 
 
 def rt_campaigns(df, dt):
@@ -51,13 +51,17 @@ def extract_base(adgroup):
 
 
 def post_chat(text):
-    url = f"https://api.clickup.com/api/v2/view/{CHAT_VIEW_ID}/comment"
-    payload = json.dumps({"comment_text": text}).encode()
+    url = f"https://api.clickup.com/api/v2/view/{CHAT_VIEW_ID}/chat"
+    payload = json.dumps({"content": text}).encode()
     req = urllib.request.Request(url, data=payload, method='POST')
     req.add_header("Authorization", CLICKUP_TOKEN)
     req.add_header("Content-Type", "application/json")
-    with urllib.request.urlopen(req) as resp:
-        return json.loads(resp.read())
+    try:
+        with urllib.request.urlopen(req) as resp:
+            return json.loads(resp.read())
+    except Exception as e:
+        print(f"Erro ao postar no ClickUp: {e}")
+        return None
 
 
 def main():

@@ -369,6 +369,29 @@ def build_briefing():
 
 
 # === TELEGRAM ===
+def send_to_clickup_chat(message):
+    """Envia para ClickUp Chat View 8cm1w4b-9913."""
+    if not CLICKUP_TOKEN:
+        return False
+
+    chat_view_id = "8cm1w4b-9913"
+    # Remove HTML tags para ClickUp
+    clean_msg = re.sub(r"</?[^>]+>", "", message)
+
+    try:
+        url = f"https://api.clickup.com/api/v2/view/{chat_view_id}/chat"
+        data = json.dumps({"content": clean_msg}).encode()
+        req = Request(url, data=data, headers={
+            "Authorization": CLICKUP_TOKEN,
+            "Content-Type": "application/json"
+        })
+        urlopen(req, timeout=10)
+        return True
+    except Exception as e:
+        print(f"Erro ClickUp Chat: {e}")
+        return False
+
+
 def send_telegram(message):
     """Envia mensagem via Telegram (split se necessário)."""
     if not TELEGRAM_TOKEN or not CHAT_ID:
@@ -468,6 +491,12 @@ def main():
     # Save Obsidian Daily Note
     obs_path = save_obsidian_daily(briefing)
     print(f"  Obsidian: {obs_path}")
+
+    # Send ClickUp Chat
+    if send_to_clickup_chat(briefing):
+        print("  ✅ Enviado para ClickUp Chat")
+    else:
+        print("  ⚠️ Falha no envio ClickUp Chat")
 
     # Send Telegram
     if send_telegram(briefing):
