@@ -1,0 +1,430 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>IMPERA — Dashboard de Performance</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0"></script>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #0f172a; color: #e2e8f0;
+        }
+
+        /* Header */
+        .header {
+            background: linear-gradient(135deg, #1e293b 0%, #0f172a 100%);
+            border-bottom: 1px solid #334155;
+            padding: 20px 32px;
+            display: flex; justify-content: space-between; align-items: center;
+        }
+        .header h1 { font-size: 22px; font-weight: 700; color: #f8fafc; }
+        .header h1 span { color: #10b981; }
+        .header .period {
+            background: #1e293b; border: 1px solid #334155; border-radius: 8px;
+            padding: 8px 16px; color: #94a3b8; font-size: 13px;
+        }
+        .date-form { display: flex; gap: 8px; align-items: center; }
+        .date-form input {
+            background: #1e293b; border: 1px solid #334155; border-radius: 6px;
+            color: #e2e8f0; padding: 6px 10px; font-size: 13px;
+        }
+        .date-form button {
+            background: #10b981; border: none; border-radius: 6px;
+            color: white; padding: 6px 16px; font-size: 13px; cursor: pointer;
+            font-weight: 600;
+        }
+        .date-form button:hover { background: #059669; }
+
+        /* KPI Cards */
+        .kpi-grid {
+            display: grid; grid-template-columns: repeat(4, 1fr);
+            gap: 16px; padding: 24px 32px;
+        }
+        .kpi-card {
+            background: #1e293b; border: 1px solid #334155; border-radius: 12px;
+            padding: 20px; position: relative; overflow: hidden;
+        }
+        .kpi-card::before {
+            content: ''; position: absolute; top: 0; left: 0;
+            width: 4px; height: 100%; border-radius: 12px 0 0 12px;
+        }
+        .kpi-card.green::before { background: #10b981; }
+        .kpi-card.blue::before { background: #3b82f6; }
+        .kpi-card.purple::before { background: #8b5cf6; }
+        .kpi-card.amber::before { background: #f59e0b; }
+        .kpi-label { font-size: 12px; color: #94a3b8; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 8px; }
+        .kpi-value { font-size: 28px; font-weight: 700; color: #f8fafc; }
+        .kpi-sub { font-size: 12px; color: #64748b; margin-top: 4px; }
+
+        /* Charts grid */
+        .charts-grid {
+            display: grid; grid-template-columns: 1fr 1fr;
+            gap: 16px; padding: 0 32px 24px;
+        }
+        .chart-card {
+            background: #1e293b; border: 1px solid #334155; border-radius: 12px;
+            padding: 20px;
+        }
+        .chart-card h3 { font-size: 14px; color: #94a3b8; margin-bottom: 16px; text-transform: uppercase; letter-spacing: 1px; }
+        .chart-container { position: relative; height: 280px; }
+
+        /* Tables */
+        .table-section { padding: 0 32px 24px; }
+        .table-card {
+            background: #1e293b; border: 1px solid #334155; border-radius: 12px;
+            padding: 20px; overflow-x: auto;
+        }
+        .table-card h3 { font-size: 14px; color: #94a3b8; margin-bottom: 16px; text-transform: uppercase; letter-spacing: 1px; }
+        table { width: 100%; border-collapse: collapse; }
+        th {
+            text-align: left; padding: 10px 12px; font-size: 11px;
+            color: #64748b; text-transform: uppercase; letter-spacing: 1px;
+            border-bottom: 1px solid #334155;
+        }
+        td {
+            padding: 12px; font-size: 13px; border-bottom: 1px solid #1e293b;
+            color: #cbd5e1;
+        }
+        tr:hover td { background: #334155; }
+        .text-right { text-align: right; }
+        .text-center { text-align: center; }
+
+        /* Badges */
+        .badge {
+            display: inline-block; padding: 3px 10px; border-radius: 12px;
+            font-size: 11px; font-weight: 600;
+        }
+        .badge-principal { background: #065f4620; color: #10b981; border: 1px solid #10b98140; }
+        .badge-positiva { background: #1e40af20; color: #3b82f6; border: 1px solid #3b82f640; }
+        .badge-risco { background: #92400e20; color: #f59e0b; border: 1px solid #f59e0b40; }
+        .badge-negativa { background: #991b1b20; color: #ef4444; border: 1px solid #ef444440; }
+
+        .roas-high { color: #10b981; font-weight: 700; }
+        .roas-mid { color: #f59e0b; font-weight: 600; }
+        .roas-low { color: #ef4444; font-weight: 700; }
+
+        /* Classification grid */
+        .cls-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; padding: 0 32px 24px; }
+        .cls-card {
+            background: #1e293b; border-radius: 10px; padding: 16px;
+            text-align: center; border: 1px solid #334155;
+        }
+        .cls-card .cls-count { font-size: 32px; font-weight: 800; }
+        .cls-card .cls-label { font-size: 11px; color: #94a3b8; margin-top: 4px; }
+        .cls-principal .cls-count { color: #10b981; }
+        .cls-positiva .cls-count { color: #3b82f6; }
+        .cls-risco .cls-count { color: #f59e0b; }
+        .cls-negativa .cls-count { color: #ef4444; }
+
+        /* Gestor cards */
+        .gestor-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 16px; padding: 0 32px 24px; }
+        .gestor-card {
+            background: #1e293b; border: 1px solid #334155; border-radius: 12px;
+            padding: 20px;
+        }
+        .gestor-card h4 { font-size: 16px; color: #f8fafc; margin-bottom: 12px; }
+        .gestor-stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+        .gestor-stat-label { font-size: 11px; color: #64748b; }
+        .gestor-stat-value { font-size: 18px; font-weight: 700; color: #e2e8f0; }
+
+        .section-title {
+            padding: 8px 32px 16px; font-size: 18px; font-weight: 700; color: #f8fafc;
+            border-top: 1px solid #334155; margin-top: 8px; padding-top: 24px;
+        }
+
+        @media (max-width: 900px) {
+            .kpi-grid, .cls-grid { grid-template-columns: repeat(2, 1fr); }
+            .charts-grid, .gestor-grid { grid-template-columns: 1fr; }
+        }
+    </style>
+</head>
+<body>
+
+<div class="header">
+    <h1><span>IMPERA</span> — Dashboard de Performance</h1>
+    <form class="date-form" method="GET">
+        <input type="date" name="date_from" value="{{ data.date_from }}">
+        <span style="color:#64748b">a</span>
+        <input type="date" name="date_to" value="{{ data.date_to }}">
+        <button type="submit">Atualizar</button>
+    </form>
+</div>
+
+<!-- KPI Cards -->
+<div class="kpi-grid">
+    <div class="kpi-card green">
+        <div class="kpi-label">Faturamento Front</div>
+        <div class="kpi-value">R${{ "{:,.0f}".format(data.totals.front_rev) }}</div>
+        <div class="kpi-sub">{{ data.campaigns|length }} campanhas ativas</div>
+    </div>
+    <div class="kpi-card blue">
+        <div class="kpi-label">Investimento</div>
+        <div class="kpi-value">R${{ "{:,.0f}".format(data.totals.cost) }}</div>
+        <div class="kpi-sub">Total em tráfego pago</div>
+    </div>
+    <div class="kpi-card purple">
+        <div class="kpi-label">ROAS Front</div>
+        <div class="kpi-value">{{ "%.2f"|format(data.totals.roas) }}</div>
+        <div class="kpi-sub">Retorno sobre investimento</div>
+    </div>
+    <div class="kpi-card amber">
+        <div class="kpi-label">Lucro</div>
+        <div class="kpi-value">R${{ "{:,.0f}".format(data.totals.front_rev - data.totals.cost) }}</div>
+        <div class="kpi-sub">Faturamento - Investimento</div>
+    </div>
+</div>
+
+<!-- Classification -->
+<div class="cls-grid">
+    <div class="cls-card cls-principal">
+        <div class="cls-count">{{ data.classificacao_count.get('Principal', 0) }}</div>
+        <div class="cls-label">Principal</div>
+    </div>
+    <div class="cls-card cls-positiva">
+        <div class="cls-count">{{ data.classificacao_count.get('Positiva', 0) }}</div>
+        <div class="cls-label">Positivas</div>
+    </div>
+    <div class="cls-card cls-risco">
+        <div class="cls-count">{{ data.classificacao_count.get('Em Risco', 0) }}</div>
+        <div class="cls-label">Em Risco</div>
+    </div>
+    <div class="cls-card cls-negativa">
+        <div class="cls-count">{{ data.classificacao_count.get('Negativa', 0) }}</div>
+        <div class="cls-label">Negativas</div>
+    </div>
+</div>
+
+<!-- Charts -->
+<div class="charts-grid">
+    <div class="chart-card">
+        <h3>Investimento por Nicho</h3>
+        <div class="chart-container">
+            <canvas id="nichoCostChart"></canvas>
+        </div>
+    </div>
+    <div class="chart-card">
+        <h3>ROAS por Nicho</h3>
+        <div class="chart-container">
+            <canvas id="nichoRoasChart"></canvas>
+        </div>
+    </div>
+    <div class="chart-card">
+        <h3>Faturamento por Gestor</h3>
+        <div class="chart-container">
+            <canvas id="gestorRevChart"></canvas>
+        </div>
+    </div>
+    <div class="chart-card">
+        <h3>ROAS por Gestor</h3>
+        <div class="chart-container">
+            <canvas id="gestorRoasChart"></canvas>
+        </div>
+    </div>
+</div>
+
+<!-- Gestor Cards -->
+<div class="section-title">Gestores de Trafego</div>
+<div class="gestor-grid">
+    {% for gestor, stats in data.gestor_stats.items() | sort(attribute='1.cost', reverse=True) %}
+    <div class="gestor-card">
+        <h4>{{ gestor }}</h4>
+        <div class="gestor-stats">
+            <div>
+                <div class="gestor-stat-label">Investido</div>
+                <div class="gestor-stat-value">R${{ "{:,.0f}".format(stats.cost) }}</div>
+            </div>
+            <div>
+                <div class="gestor-stat-label">Faturamento</div>
+                <div class="gestor-stat-value">R${{ "{:,.0f}".format(stats.front_rev) }}</div>
+            </div>
+            <div>
+                <div class="gestor-stat-label">ROAS</div>
+                {% set roas = stats.front_rev / stats.cost if stats.cost > 0 else 0 %}
+                <div class="gestor-stat-value {% if roas >= 2 %}roas-high{% elif roas >= 1.5 %}roas-mid{% else %}roas-low{% endif %}">
+                    {{ "%.2f"|format(roas) }}
+                </div>
+            </div>
+            <div>
+                <div class="gestor-stat-label">Testes</div>
+                <div class="gestor-stat-value">{{ stats.testes }}</div>
+            </div>
+            <div>
+                <div class="gestor-stat-label">Validadas</div>
+                <div class="gestor-stat-value">{{ stats.validadas }}</div>
+            </div>
+            <div>
+                <div class="gestor-stat-label">Taxa</div>
+                {% set taxa = (stats.validadas / stats.testes * 100) if stats.testes > 0 else 0 %}
+                <div class="gestor-stat-value">{{ "%.0f"|format(taxa) }}%</div>
+            </div>
+        </div>
+    </div>
+    {% endfor %}
+</div>
+
+<!-- Campaigns Table -->
+<div class="section-title">Todas as Campanhas</div>
+<div class="table-section">
+    <div class="table-card">
+        <table>
+            <thead>
+                <tr>
+                    <th>Campanha</th>
+                    <th>Nicho</th>
+                    <th>Gestor</th>
+                    <th class="text-right">Investido</th>
+                    <th class="text-right">Faturamento</th>
+                    <th class="text-right">ROAS</th>
+                    <th class="text-center">Status</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for c in data.campaigns %}
+                <tr>
+                    <td style="max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">{{ c.name }}</td>
+                    <td>{{ data.nicho_names.get(c.nicho, c.nicho) }}</td>
+                    <td>{{ c.gestor }}</td>
+                    <td class="text-right">R${{ "{:,.0f}".format(c.cost) }}</td>
+                    <td class="text-right">R${{ "{:,.0f}".format(c.front_rev) }}</td>
+                    <td class="text-right {% if c.roas >= 2 %}roas-high{% elif c.roas >= 1.5 %}roas-mid{% else %}roas-low{% endif %}">
+                        {{ "%.2f"|format(c.roas) }}
+                    </td>
+                    <td class="text-center">
+                        <span class="badge badge-{{ c.classificacao|lower|replace(' ', '-')|replace('em-risco','risco') }}">
+                            {{ c.classificacao }}
+                        </span>
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</div>
+
+<div style="padding:32px;text-align:center;color:#475569;font-size:12px;">
+    IMPERA PRODUTOS NATURAIS — Dashboard gerado automaticamente via Claude Code
+</div>
+
+<script>
+const chartDefaults = {
+    responsive: true,
+    maintainAspectRatio: false,
+    plugins: { legend: { display: false } },
+};
+
+// Nicho data
+const nichoData = {{ data.nicho_stats | tojson }};
+const nichoNames = {{ data.nicho_names | tojson }};
+const nichoColors = {{ data.nicho_colors | tojson }};
+
+const nichoLabels = Object.keys(nichoData)
+    .sort((a, b) => nichoData[b].cost - nichoData[a].cost)
+    .map(k => nichoNames[k] || k);
+const nichoKeys = Object.keys(nichoData).sort((a, b) => nichoData[b].cost - nichoData[a].cost);
+const nichoCosts = nichoKeys.map(k => nichoData[k].cost);
+const nichoRevs = nichoKeys.map(k => nichoData[k].front_rev);
+const nichoRoas = nichoKeys.map(k => nichoData[k].cost > 0 ? (nichoData[k].front_rev / nichoData[k].cost) : 0);
+const nichoClrs = nichoKeys.map(k => nichoColors[k] || '#6366f1');
+
+// Nicho Cost Chart (Doughnut)
+new Chart(document.getElementById('nichoCostChart'), {
+    type: 'doughnut',
+    data: {
+        labels: nichoLabels,
+        datasets: [{
+            data: nichoCosts,
+            backgroundColor: nichoClrs,
+            borderWidth: 0,
+        }]
+    },
+    options: {
+        ...chartDefaults,
+        cutout: '65%',
+        plugins: {
+            legend: { display: true, position: 'right', labels: { color: '#94a3b8', font: { size: 11 }, padding: 12 } }
+        }
+    }
+});
+
+// Nicho ROAS Chart (Bar)
+new Chart(document.getElementById('nichoRoasChart'), {
+    type: 'bar',
+    data: {
+        labels: nichoLabels,
+        datasets: [{
+            data: nichoRoas,
+            backgroundColor: nichoClrs,
+            borderRadius: 6,
+        }]
+    },
+    options: {
+        ...chartDefaults,
+        indexAxis: 'y',
+        scales: {
+            x: { grid: { color: '#1e293b' }, ticks: { color: '#64748b' } },
+            y: { grid: { display: false }, ticks: { color: '#94a3b8', font: { size: 11 } } }
+        },
+        plugins: {
+            legend: { display: false },
+            annotation: {
+                annotations: {
+                    line1: { type: 'line', xMin: 1.5, xMax: 1.5, borderColor: '#f59e0b40', borderWidth: 1, borderDash: [4,4] }
+                }
+            }
+        }
+    }
+});
+
+// Gestor data
+const gestorData = {{ data.gestor_stats | tojson }};
+const gestorLabels = Object.keys(gestorData).sort((a, b) => gestorData[b].front_rev - gestorData[a].front_rev);
+const gestorRevs = gestorLabels.map(k => gestorData[k].front_rev);
+const gestorRoas = gestorLabels.map(k => gestorData[k].cost > 0 ? (gestorData[k].front_rev / gestorData[k].cost) : 0);
+const gestorColors = ['#10b981', '#3b82f6', '#8b5cf6', '#f59e0b'];
+
+// Gestor Revenue Chart
+new Chart(document.getElementById('gestorRevChart'), {
+    type: 'bar',
+    data: {
+        labels: gestorLabels,
+        datasets: [{
+            data: gestorRevs,
+            backgroundColor: gestorColors,
+            borderRadius: 6,
+        }]
+    },
+    options: {
+        ...chartDefaults,
+        scales: {
+            x: { grid: { display: false }, ticks: { color: '#94a3b8', font: { size: 11 } } },
+            y: { grid: { color: '#1e293b' }, ticks: { color: '#64748b', callback: v => 'R$' + (v/1000).toFixed(0) + 'k' } }
+        }
+    }
+});
+
+// Gestor ROAS Chart
+new Chart(document.getElementById('gestorRoasChart'), {
+    type: 'bar',
+    data: {
+        labels: gestorLabels,
+        datasets: [{
+            data: gestorRoas,
+            backgroundColor: gestorColors.map(c => c + '80'),
+            borderColor: gestorColors,
+            borderWidth: 2,
+            borderRadius: 6,
+        }]
+    },
+    options: {
+        ...chartDefaults,
+        scales: {
+            x: { grid: { display: false }, ticks: { color: '#94a3b8', font: { size: 11 } } },
+            y: { grid: { color: '#1e293b' }, ticks: { color: '#64748b' }, min: 0 }
+        }
+    }
+});
+</script>
+</body>
+</html>

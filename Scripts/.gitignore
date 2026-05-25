@@ -1,0 +1,23 @@
+# Credenciais e tokens
+google_credentials_*.json
+google_token_*.json
+*.env
+
+# Estado runtime (muda a cada execução)
+data/
+*_history.json
+*_processed.json
+
+# Binários
+ffmpeg
+
+# Logs
+*.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# OS
+.DS_Store

@@ -1,0 +1,24 @@
+# render.yaml — Metabase self-hosted
+# Deploy: No Render, New > Web Service > Docker
+services:
+  - type: web
+    name: impera-metabase
+    runtime: docker
+    dockerfilePath: ./Dockerfile.metabase
+    plan: free
+    region: oregon
+    envVars:
+      - key: MB_DB_TYPE
+        value: postgres
+      - key: MB_DB_DBNAME
+        value: impera
+      - key: MB_DB_PORT
+        value: "5432"
+      - key: MB_DB_USER
+        value: impera_user
+      - key: MB_DB_PASS
+        value: vZTMeGOsf9bCQJD02pNY6tPeU2c7CMGV
+      - key: MB_DB_HOST
+        value: dpg-d7skkknavr4c73f4ecrg-a.oregon-postgres.render.com
+      - key: JAVA_OPTS
+        value: "-Xmx384m"

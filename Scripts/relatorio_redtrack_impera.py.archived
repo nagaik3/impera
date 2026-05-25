@@ -1,0 +1,1329 @@
+#!/usr/bin/env python3
+"""
+Relatório Semanal de Performance — IMPERA PRODUTOS NATURAIS
+Busca dados do RedTrack e gera .docx com análise de ofertas, nichos e gestores.
+Inclui comparativo semanal e relatórios individuais por gestor.
+Crontab: todo domingo às 12h.
+"""
+
+import json
+import logging
+import os
+import re
+import subprocess
+import sys
+import urllib.request
+from collections import defaultdict
+from datetime import datetime, timedelta
+
+import pandas as pd
+
+# === DATA LAKE: importar modulo de insercao no PostgreSQL ===
+sys.path.insert(0, os.path.expanduser("~/Scripts"))
+try:
+    from database.impera_db import inserir_dados
+    DB_AVAILABLE = True
+except ImportError:
+    DB_AVAILABLE = False
+    print("⚠️ Modulo database nao encontrado — apenas gerando .docx/.pdf")
+
+logger = logging.getLogger(__name__)
+
+# === CONFIG ===
+REDTRACK_API_KEY = os.environ.get("REDTRACK_API_KEY", "")
+OUTPUT_DIR = os.path.expanduser("~/Documents")
+
+NICHO_MAP = {
+    'EMAGRECIMENTO': 'EM', 'DIABETES': 'DB', 'NEUROPATIA': 'NE',
+    'MEMORIA': 'MM', 'PROSTATA': 'PT', 'DORES': 'DA',
+    'ZUMBIDO': 'ZB', 'ADULTO': 'ED', 'REJUVENESCIMENTO': 'RJ',
+    'GELATINAFIT': 'EM', 'GELATINA': 'EM', 'EREMED': 'ED',
+}
+
+NICHO_NAMES = {
+    'EM': 'Emagrecimento', 'DB': 'Diabetes', 'NE': 'Neuropatia',
+    'MM': 'Memória BR', 'ME': 'Memória EUA', 'PT': 'Próstata',
+    'DA': 'Dores Articulares', 'ED': 'Adulto / ED', 'ZB': 'Zumbido',
+    'RJ': 'Rejuvenescimento',
+}
+
+GESTOR_MAP = {
+    'LUCAS': 'Lucas Cavalcanti', 'LUDSON': 'Ludson Chaves',
+    'DOUG': 'Douglas Oliveira', 'DOUGLAS': 'Douglas Oliveira',
+    'FRAZA': 'Gabriel Fraza', 'GABRIEL': 'Gabriel Fraza',
+    'GUSTAVO': 'Gustavo Lisner',
+}
+
+# Fonte → gestor default (campanhas sem G. no nome)
+FONTE_GESTOR_DEFAULT = {
+    'TB': 'Gabriel Fraza',   # Taboola = Gabriel
+    'YT': 'Gabriel Fraza',   # YouTube = Gabriel
+    'KW': 'Gustavo Lisner',  # Kwai = Gustavo
+}
+
+
+def api_get(date_from, date_to, max_retries=3):
+    import time as _t
+    url = (
+        f"https://api.redtrack.io/report?api_key={REDTRACK_API_KEY}"
+        f"&group=campaign&date_from={date_from}&date_to={date_to}"
+        f"&total=true&per=200"
+    )
+    for attempt in range(max_retries):
+        try:
+            req = urllib.request.Request(url)
+            with urllib.request.urlopen(req) as resp:
+                return json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            if e.code == 429 and attempt < max_retries - 1:
+                wait = 2 ** (attempt + 1)  # 2s, 4s, 8s
+                print(f"  ⚠️ Rate limit 429 — retry {attempt+1}/{max_retries} em {wait}s...")
+                _t.sleep(wait)
+            else:
+                raise
+
+
+def parse_campaign(name):
+    info = {'name': name}
+
+    m = re.match(r'\[(\w+)\]', name)
+    info['fonte'] = m.group(1) if m else '?'
+
+    m = re.search(r'VSL\s*(\d+)', name)
+    info['oferta'] = f"VSL {m.group(1)}" if m else '-'
+
+    info['nicho'] = '?'
+    name_upper = name.upper()
+
+    if 'MEMORIA EUA' in name_upper or 'MEMÓRIA EUA' in name_upper:
+        info['nicho'] = 'ME'
+    elif 'GELATINAFIT' in name_upper or 'GELATINA' in name_upper:
+        info['nicho'] = 'EM'
+    elif 'EREMED' in name_upper:
+        info['nicho'] = 'ED'
+    else:
+        for keyword, sigla in NICHO_MAP.items():
+            if keyword in name_upper:
+                info['nicho'] = sigla
+                break
+
+    if 'EMAGRECIMENTOLUDSON' in name_upper:
+        info['nicho'] = 'EM'
+
+    info['gestor'] = '?'
+    # 1. Padrão G.NOME
+    g = re.search(r'G\.\s*(\w+)', name, re.IGNORECASE)
+    if g:
+        gestor_key = g.group(1).upper()
+        info['gestor'] = GESTOR_MAP.get(gestor_key, g.group(1))
+    else:
+        # 2. Nome do gestor direto no nome da campanha
+        for key, full_name in GESTOR_MAP.items():
+            if full_name.lower() in name.lower() or (len(key) > 3 and key.lower() in name.lower()):
+                info['gestor'] = full_name
+                break
+        # 3. Fallback por fonte (TB=Gabriel, KW=Gustavo)
+        if info['gestor'] == '?' and info['fonte'] in FONTE_GESTOR_DEFAULT:
+            info['gestor'] = FONTE_GESTOR_DEFAULT[info['fonte']]
+
+    p = re.search(r'P\.\s*([^|]+)', name)
+    info['conta'] = p.group(1).strip() if p else '-'
+
+    return info
+
+
+def classify_offer(c):
+    """Classificação Super Cérebro V5: vendas + CPA + ROAS Front."""
+    vendas = c.get('vendas', 0)
+    cpa = c['cost'] / vendas if vendas > 0 else float('inf')
+    roas = c['roas']
+    if vendas >= 30 and roas >= 1.8:
+        return '🏆 Top / Escala'
+    elif vendas >= 10 and cpa <= 180 and roas >= 1.8:
+        return '✅ Validado'
+    elif vendas >= 3 and cpa <= 180 and roas >= 1.8:
+        return '🟡 Pré-validado'
+    elif roas < 1.0:
+        return '🔴 Negativa'
+    else:
+        return '🔵 Em Teste'
+
+
+def get_week_range():
+    today = datetime.now()
+    end = today - timedelta(days=1)
+    start = end - timedelta(days=6)
+    return start.strftime('%Y-%m-%d'), end.strftime('%Y-%m-%d')
+
+
+def get_prev_week_range():
+    today = datetime.now()
+    end = today - timedelta(days=8)
+    start = end - timedelta(days=6)
+    return start.strftime('%Y-%m-%d'), end.strftime('%Y-%m-%d')
+
+
+def process_campaigns(items):
+    """Process raw API items into campaign dicts."""
+    campaigns = []
+    for item in items:
+        cost = item.get('cost', 0)
+        if cost <= 0:
+            continue
+        info = parse_campaign(item.get('campaign', ''))
+        front_rev = item.get('revenuetype2', 0) + item.get('revenuetype3', 0)
+        roas = front_rev / cost if cost > 0 else 0
+        info.update({
+            'cost': cost,
+            'front_rev': front_rev,
+            'roas': roas,
+            'profit': item.get('profit', 0),
+            'vendas': int(item.get('convtype1', 0)),
+        })
+        info['classificacao'] = classify_offer(info)
+        campaigns.append(info)
+    campaigns.sort(key=lambda x: -x['cost'])
+    return campaigns
+
+
+def aggregate_stats(campaigns):
+    """Return nicho_stats, gestor_stats, totals from campaigns."""
+    nicho_stats = defaultdict(lambda: {'cost': 0, 'front_rev': 0, 'vendas': 0, 'campaigns': 0})
+    for c in campaigns:
+        n = nicho_stats[c['nicho']]
+        n['cost'] += c['cost']
+        n['front_rev'] += c['front_rev']
+        n['vendas'] += c.get('vendas', 0)
+        n['campaigns'] += 1
+
+    gestor_stats = defaultdict(lambda: {'cost': 0, 'front_rev': 0, 'vendas': 0, 'campaigns': 0, 'fontes': set()})
+    for c in campaigns:
+        g = gestor_stats[c['gestor']]
+        g['cost'] += c['cost']
+        g['front_rev'] += c['front_rev']
+        g['vendas'] += c.get('vendas', 0)
+        g['campaigns'] += 1
+        if c.get('fonte') and c['fonte'] != '?':
+            g['fontes'].add(c['fonte'])
+
+    totals = {
+        'cost': sum(c['cost'] for c in campaigns),
+        'front_rev': sum(c['front_rev'] for c in campaigns),
+        'vendas': sum(c.get('vendas', 0) for c in campaigns),
+    }
+    return nicho_stats, gestor_stats, totals
+
+
+def build_gestor_detail(campaigns):
+    """Build detailed stats per gestor."""
+    gestor_detail = defaultdict(lambda: {
+        'cost': 0, 'front_rev': 0, 'vendas': 0, 'total': 0,
+        'validadas': 0, 'negativas': 0,
+        'fontes': set(),
+        'nichos': defaultdict(lambda: {'cost': 0, 'front_rev': 0, 'vendas': 0, 'camps': 0}),
+        'campanhas': [],
+    })
+    for c in campaigns:
+        gd = gestor_detail[c['gestor']]
+        gd['cost'] += c['cost']
+        gd['front_rev'] += c['front_rev']
+        gd['vendas'] += c.get('vendas', 0)
+        gd['total'] += 1
+        if c.get('fonte') and c['fonte'] != '?':
+            gd['fontes'].add(c['fonte'])
+        if c['roas'] >= 1.8:
+            gd['validadas'] += 1
+        if c['roas'] < 1.0:
+            gd['negativas'] += 1
+        gd['nichos'][c['nicho']]['cost'] += c['cost']
+        gd['nichos'][c['nicho']]['front_rev'] += c['front_rev']
+        gd['nichos'][c['nicho']]['vendas'] += c.get('vendas', 0)
+        gd['nichos'][c['nicho']]['camps'] += 1
+        gd['campanhas'].append(c)
+    return gestor_detail
+
+
+def _delta_arrow(current, previous):
+    """Return arrow + percentage change string."""
+    if previous == 0:
+        return "🆕" if current > 0 else "—"
+    pct = ((current - previous) / previous) * 100
+    if pct > 0:
+        return f"⬆️ +{pct:.1f}%"
+    elif pct < 0:
+        return f"⬇️ {pct:.1f}%"
+    else:
+        return "➡️ 0%"
+
+
+def _roas_delta(current, previous):
+    """Return arrow + absolute ROAS change."""
+    diff = current - previous
+    if diff > 0:
+        return f"⬆️ +{diff:.2f}"
+    elif diff < 0:
+        return f"⬇️ {diff:.2f}"
+    else:
+        return "➡️ 0.00"
+
+
+def add_comparison_section(doc, curr_totals, prev_totals, curr_gestor_stats, prev_gestor_stats,
+                           curr_nicho_stats, prev_nicho_stats, prev_date_from, prev_date_to):
+    """Add weekly comparison section at the beginning of the doc."""
+    from docx.shared import Pt, RGBColor
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.enum.table import WD_TABLE_ALIGNMENT
+
+    pdf = datetime.strptime(prev_date_from, '%Y-%m-%d').strftime('%d.%m')
+    pdt = datetime.strptime(prev_date_to, '%Y-%m-%d').strftime('%d.%m')
+
+    doc.add_heading(f"Comparativo Semanal (vs {pdf}–{pdt})", level=2)
+
+    # --- KPIs Gerais ---
+    c_cost = curr_totals['cost']
+    c_rev = curr_totals['front_rev']
+    c_roas = c_rev / c_cost if c_cost > 0 else 0
+    p_cost = prev_totals['cost']
+    p_rev = prev_totals['front_rev']
+    p_roas = p_rev / p_cost if p_cost > 0 else 0
+
+    headers = ["KPI", "Semana Anterior", "Semana Atual", "Variação"]
+    table = doc.add_table(rows=4, cols=4)
+    table.style = "Light Grid Accent 1"
+    table.alignment = WD_TABLE_ALIGNMENT.CENTER
+
+    for i, h in enumerate(headers):
+        cell = table.rows[0].cells[i]
+        cell.text = h
+        for p in cell.paragraphs:
+            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            for run in p.runs:
+                run.bold = True
+                run.font.size = Pt(9)
+
+    kpi_rows = [
+        ("Investimento", f"R${p_cost:,.0f}", f"R${c_cost:,.0f}", _delta_arrow(c_cost, p_cost)),
+        ("Faturamento Front", f"R${p_rev:,.0f}", f"R${c_rev:,.0f}", _delta_arrow(c_rev, p_rev)),
+        ("ROAS", f"{p_roas:.2f}", f"{c_roas:.2f}", _roas_delta(c_roas, p_roas)),
+    ]
+    for ri, (label, prev_val, curr_val, delta) in enumerate(kpi_rows):
+        row = table.rows[ri + 1]
+        row.cells[0].text = label
+        row.cells[1].text = prev_val
+        row.cells[2].text = curr_val
+        row.cells[3].text = delta
+        for ci in range(4):
+            for p in row.cells[ci].paragraphs:
+                p.alignment = WD_ALIGN_PARAGRAPH.CENTER if ci > 0 else WD_ALIGN_PARAGRAPH.LEFT
+                for run in p.runs:
+                    run.font.size = Pt(9)
+                    if ci == 0:
+                        run.bold = True
+
+    doc.add_paragraph("")
+
+    # --- Comparativo por Gestor ---
+    doc.add_heading("Comparativo por Gestor", level=3)
+    all_gestores = sorted(set(list(curr_gestor_stats.keys()) + list(prev_gestor_stats.keys())))
+
+    headers_g = ["Gestor", "Cost Ant.", "Cost Atual", "Δ Cost", "ROAS Ant.", "ROAS Atual", "Δ ROAS"]
+    gt = doc.add_table(rows=1 + len(all_gestores), cols=len(headers_g))
+    gt.style = "Light Grid Accent 1"
+    gt.alignment = WD_TABLE_ALIGNMENT.CENTER
+
+    for i, h in enumerate(headers_g):
+        gt.rows[0].cells[i].text = h
+        for p in gt.rows[0].cells[i].paragraphs:
+            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            for run in p.runs:
+                run.bold = True
+                run.font.size = Pt(8)
+
+    for ri, gestor in enumerate(all_gestores):
+        cs = curr_gestor_stats.get(gestor, {'cost': 0, 'front_rev': 0, 'campaigns': 0})
+        ps = prev_gestor_stats.get(gestor, {'cost': 0, 'front_rev': 0, 'campaigns': 0})
+        c_r = cs['front_rev'] / cs['cost'] if cs['cost'] > 0 else 0
+        p_r = ps['front_rev'] / ps['cost'] if ps['cost'] > 0 else 0
+
+        row_data = [
+            gestor,
+            f"R${ps['cost']:,.0f}", f"R${cs['cost']:,.0f}", _delta_arrow(cs['cost'], ps['cost']),
+            f"{p_r:.2f}", f"{c_r:.2f}", _roas_delta(c_r, p_r),
+        ]
+        for ci, val in enumerate(row_data):
+            gt.rows[ri + 1].cells[ci].text = val
+            for p in gt.rows[ri + 1].cells[ci].paragraphs:
+                p.alignment = WD_ALIGN_PARAGRAPH.CENTER if ci > 0 else WD_ALIGN_PARAGRAPH.LEFT
+                for run in p.runs:
+                    run.font.size = Pt(8)
+
+    doc.add_paragraph("")
+
+    # --- Comparativo por Nicho ---
+    doc.add_heading("Comparativo por Nicho", level=3)
+    all_nichos = sorted(set(list(curr_nicho_stats.keys()) + list(prev_nicho_stats.keys())))
+
+    headers_n = ["Nicho", "Cost Ant.", "Cost Atual", "Δ Cost", "ROAS Ant.", "ROAS Atual", "Δ ROAS"]
+    nt = doc.add_table(rows=1 + len(all_nichos), cols=len(headers_n))
+    nt.style = "Light Grid Accent 1"
+    nt.alignment = WD_TABLE_ALIGNMENT.CENTER
+
+    for i, h in enumerate(headers_n):
+        nt.rows[0].cells[i].text = h
+        for p in nt.rows[0].cells[i].paragraphs:
+            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            for run in p.runs:
+                run.bold = True
+                run.font.size = Pt(8)
+
+    for ri, sigla in enumerate(all_nichos):
+        cs = curr_nicho_stats.get(sigla, {'cost': 0, 'front_rev': 0, 'campaigns': 0})
+        ps = prev_nicho_stats.get(sigla, {'cost': 0, 'front_rev': 0, 'campaigns': 0})
+        c_r = cs['front_rev'] / cs['cost'] if cs['cost'] > 0 else 0
+        p_r = ps['front_rev'] / ps['cost'] if ps['cost'] > 0 else 0
+        label = NICHO_NAMES.get(sigla, sigla)
+
+        row_data = [
+            label,
+            f"R${ps['cost']:,.0f}", f"R${cs['cost']:,.0f}", _delta_arrow(cs['cost'], ps['cost']),
+            f"{p_r:.2f}", f"{c_r:.2f}", _roas_delta(c_r, p_r),
+        ]
+        for ci, val in enumerate(row_data):
+            nt.rows[ri + 1].cells[ci].text = val
+            for p in nt.rows[ri + 1].cells[ci].paragraphs:
+                p.alignment = WD_ALIGN_PARAGRAPH.CENTER if ci > 0 else WD_ALIGN_PARAGRAPH.LEFT
+                for run in p.runs:
+                    run.font.size = Pt(8)
+
+    doc.add_paragraph("")
+    doc.add_page_break()
+
+
+def add_gestor_comparison(doc, gestor, curr_gd, prev_gd, prev_date_from, prev_date_to):
+    """Add comparison section for a single gestor."""
+    from docx.shared import Pt
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.enum.table import WD_TABLE_ALIGNMENT
+
+    pdf = datetime.strptime(prev_date_from, '%Y-%m-%d').strftime('%d.%m')
+    pdt = datetime.strptime(prev_date_to, '%Y-%m-%d').strftime('%d.%m')
+
+    doc.add_heading(f"Comparativo Semanal (vs {pdf}–{pdt})", level=2)
+
+    c_cost = curr_gd['cost']
+    c_rev = curr_gd['front_rev']
+    c_roas = c_rev / c_cost if c_cost > 0 else 0
+    c_taxa = curr_gd['validadas'] / curr_gd['total'] * 100 if curr_gd['total'] > 0 else 0
+
+    p_cost = prev_gd['cost']
+    p_rev = prev_gd['front_rev']
+    p_roas = p_rev / p_cost if p_cost > 0 else 0
+    p_taxa = prev_gd['validadas'] / prev_gd['total'] * 100 if prev_gd['total'] > 0 else 0
+
+    headers = ["KPI", "Semana Anterior", "Semana Atual", "Variação"]
+    table = doc.add_table(rows=7, cols=4)
+    table.style = "Light Grid Accent 1"
+    table.alignment = WD_TABLE_ALIGNMENT.CENTER
+
+    for i, h in enumerate(headers):
+        cell = table.rows[0].cells[i]
+        cell.text = h
+        for p in cell.paragraphs:
+            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            for run in p.runs:
+                run.bold = True
+                run.font.size = Pt(9)
+
+    kpi_rows = [
+        ("Campanhas", str(prev_gd['total']), str(curr_gd['total']),
+         _delta_arrow(curr_gd['total'], prev_gd['total'])),
+        ("Investimento", f"R${p_cost:,.0f}", f"R${c_cost:,.0f}",
+         _delta_arrow(c_cost, p_cost)),
+        ("Faturamento Front", f"R${p_rev:,.0f}", f"R${c_rev:,.0f}",
+         _delta_arrow(c_rev, p_rev)),
+        ("ROAS", f"{p_roas:.2f}", f"{c_roas:.2f}",
+         _roas_delta(c_roas, p_roas)),
+        ("Validadas", str(prev_gd['validadas']), str(curr_gd['validadas']),
+         _delta_arrow(curr_gd['validadas'], prev_gd['validadas'])),
+        ("Taxa Validação", f"{p_taxa:.0f}%", f"{c_taxa:.0f}%",
+         _delta_arrow(c_taxa, p_taxa)),
+    ]
+    for ri, (label, prev_val, curr_val, delta) in enumerate(kpi_rows):
+        row = table.rows[ri + 1]
+        row.cells[0].text = label
+        row.cells[1].text = prev_val
+        row.cells[2].text = curr_val
+        row.cells[3].text = delta
+        for ci in range(4):
+            for p in row.cells[ci].paragraphs:
+                p.alignment = WD_ALIGN_PARAGRAPH.CENTER if ci > 0 else WD_ALIGN_PARAGRAPH.LEFT
+                for run in p.runs:
+                    run.font.size = Pt(9)
+                    if ci == 0:
+                        run.bold = True
+
+    # Comparativo por nicho do gestor
+    curr_nichos = curr_gd.get('nichos', {})
+    prev_nichos = prev_gd.get('nichos', {})
+    all_nichos = sorted(set(list(curr_nichos.keys()) + list(prev_nichos.keys())))
+
+    if all_nichos:
+        doc.add_paragraph("")
+        doc.add_heading("Comparativo por Nicho", level=3)
+
+        headers_n = ["Nicho", "Cost Ant.", "Cost Atual", "Δ Cost", "ROAS Ant.", "ROAS Atual", "Δ ROAS"]
+        nt = doc.add_table(rows=1 + len(all_nichos), cols=len(headers_n))
+        nt.style = "Light Grid Accent 1"
+        nt.alignment = WD_TABLE_ALIGNMENT.CENTER
+
+        for i, h in enumerate(headers_n):
+            nt.rows[0].cells[i].text = h
+            for p in nt.rows[0].cells[i].paragraphs:
+                p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                for run in p.runs:
+                    run.bold = True
+                    run.font.size = Pt(8)
+
+        for ri, sigla in enumerate(all_nichos):
+            cn = curr_nichos.get(sigla, {'cost': 0, 'front_rev': 0, 'camps': 0})
+            pn = prev_nichos.get(sigla, {'cost': 0, 'front_rev': 0, 'camps': 0})
+            c_r = cn['front_rev'] / cn['cost'] if cn['cost'] > 0 else 0
+            p_r = pn['front_rev'] / pn['cost'] if pn['cost'] > 0 else 0
+            label = NICHO_NAMES.get(sigla, sigla)
+
+            row_data = [
+                label,
+                f"R${pn['cost']:,.0f}", f"R${cn['cost']:,.0f}", _delta_arrow(cn['cost'], pn['cost']),
+                f"{p_r:.2f}", f"{c_r:.2f}", _roas_delta(c_r, p_r),
+            ]
+            for ci, val in enumerate(row_data):
+                nt.rows[ri + 1].cells[ci].text = val
+                for p in nt.rows[ri + 1].cells[ci].paragraphs:
+                    p.alignment = WD_ALIGN_PARAGRAPH.CENTER if ci > 0 else WD_ALIGN_PARAGRAPH.LEFT
+                    for run in p.runs:
+                        run.font.size = Pt(8)
+
+    doc.add_paragraph("")
+    doc.add_page_break()
+
+
+def build_docx(campaigns, nicho_stats, gestor_stats, date_from, date_to, totals,
+               prev_campaigns=None, prev_date_from=None, prev_date_to=None):
+    from docx import Document
+    from docx.shared import Pt, RGBColor
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.enum.table import WD_TABLE_ALIGNMENT
+
+    doc = Document()
+    style = doc.styles["Normal"]
+    style.font.name = "Calibri"
+    style.font.size = Pt(10)
+
+    df = datetime.strptime(date_from, '%Y-%m-%d').strftime('%d.%m')
+    dt = datetime.strptime(date_to, '%Y-%m-%d').strftime('%d.%m')
+
+    t = doc.add_heading(f"Relatório de Performance — RedTrack [{df} a {dt}]", level=1)
+    t.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+    t_cost = totals.get('cost', 0)
+    t_rev = totals.get('front_rev', 0)
+    t_roas = t_rev / t_cost if t_cost > 0 else 0
+    doc.add_paragraph(
+        f"Investimento Total: R${t_cost:,.0f} | "
+        f"Faturamento Front: R${t_rev:,.0f} | "
+        f"ROAS: {t_roas:.2f} | "
+        f"Gerado em {datetime.now().strftime('%d/%m/%Y %H:%M')}"
+    )
+
+    # === COMPARATIVO SEMANAL ===
+    if prev_campaigns is not None:
+        prev_nicho_stats, prev_gestor_stats, prev_totals = aggregate_stats(prev_campaigns)
+        add_comparison_section(doc, totals, prev_totals, gestor_stats, prev_gestor_stats,
+                               nicho_stats, prev_nicho_stats, prev_date_from, prev_date_to)
+
+    # === Critérios ===
+    doc.add_heading("Critérios de Classificação", level=2)
+    criterios = [
+        ("🏆 Top / Escala", "30+ vendas, ROAS Front ≥ 1.8 — escala confirmada"),
+        ("✅ Validado", "10+ vendas, CPA ≤ R$180, ROAS Front ≥ 1.8 — validado para escalar"),
+        ("🟡 Pré-validado", "3-9 vendas, CPA ≤ R$180, ROAS Front ≥ 1.8 — promissor"),
+        ("🔵 Em Teste", "< 3 vendas ou métricas fora da meta — em fase de teste"),
+        ("🔴 Negativa", "ROAS < 1.0 — prejuízo, ação imediata necessária"),
+    ]
+    for label, desc in criterios:
+        p = doc.add_paragraph(style="List Bullet")
+        run = p.add_run(f"{label}: ")
+        run.bold = True
+        p.add_run(desc)
+
+    doc.add_paragraph("")
+
+    # === Classification tables ===
+    classifications = ['🏆 Top / Escala', '✅ Validado', '🟡 Pré-validado', '🔵 Em Teste', '🔴 Negativa']
+
+    for cls in classifications:
+        group = [c for c in campaigns if c['classificacao'] == cls]
+        if not group:
+            continue
+
+        g_cost = sum(c['cost'] for c in group)
+        g_rev = sum(c['front_rev'] for c in group)
+        g_roas = g_rev / g_cost if g_cost > 0 else 0
+
+        doc.add_heading(
+            f"{cls} — {len(group)} campanhas | R${g_cost:,.0f} invest. | ROAS {g_roas:.2f}",
+            level=2
+        )
+
+        headers = ["Campanha", "Nicho", "Gestor", "Cost", "Front Rev", "ROAS", "Vendas"]
+        table = doc.add_table(rows=1 + len(group), cols=len(headers))
+        table.style = "Light Grid Accent 1"
+        table.alignment = WD_TABLE_ALIGNMENT.CENTER
+
+        for i, h in enumerate(headers):
+            cell = table.rows[0].cells[i]
+            cell.text = h
+            for p in cell.paragraphs:
+                p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                for run in p.runs:
+                    run.bold = True
+                    run.font.size = Pt(8)
+
+        for ri, c in enumerate(group):
+            nicho_label = NICHO_NAMES.get(c['nicho'], c['nicho'])
+            row_data = [
+                c['name'][:50],
+                nicho_label,
+                c['gestor'],
+                f"R${c['cost']:,.0f}",
+                f"R${c['front_rev']:,.0f}",
+                f"{c['roas']:.2f}",
+                str(c.get('vendas', 0)),
+            ]
+            for ci, val in enumerate(row_data):
+                cell = table.rows[ri + 1].cells[ci]
+                cell.text = val
+                for p in cell.paragraphs:
+                    p.alignment = WD_ALIGN_PARAGRAPH.CENTER if ci > 0 else WD_ALIGN_PARAGRAPH.LEFT
+                    for run in p.runs:
+                        run.font.size = Pt(8)
+                        if ci == 5:
+                            roas_val = c['roas']
+                            if roas_val >= 2.0:
+                                run.font.color.rgb = RGBColor(0x12, 0xa5, 0x94)
+                            elif roas_val < 1.0:
+                                run.font.color.rgb = RGBColor(0xe5, 0x48, 0x4d)
+
+        doc.add_paragraph("")
+
+    # === PAGE BREAK ===
+    doc.add_page_break()
+
+    # === Por Nicho ===
+    doc.add_heading("Performance por Nicho", level=2)
+
+    headers_n = ["Nicho", "Campanhas", "Investido", "Faturamento", "ROAS"]
+    sorted_nichos = sorted(nicho_stats.keys(), key=lambda x: -nicho_stats[x]['cost'])
+    table = doc.add_table(rows=2 + len(sorted_nichos), cols=len(headers_n))
+    table.style = "Light Grid Accent 1"
+    table.alignment = WD_TABLE_ALIGNMENT.CENTER
+
+    for i, h in enumerate(headers_n):
+        cell = table.rows[0].cells[i]
+        cell.text = h
+        for p in cell.paragraphs:
+            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            for run in p.runs:
+                run.bold = True
+                run.font.size = Pt(9)
+
+    for ri, sigla in enumerate(sorted_nichos):
+        s = nicho_stats[sigla]
+        roas = s['front_rev'] / s['cost'] if s['cost'] > 0 else 0
+        label = NICHO_NAMES.get(sigla, sigla)
+        row_data = [label, str(s['campaigns']), f"R${s['cost']:,.0f}", f"R${s['front_rev']:,.0f}", f"{roas:.2f}"]
+        for ci, val in enumerate(row_data):
+            cell = table.rows[ri + 1].cells[ci]
+            cell.text = val
+            for p in cell.paragraphs:
+                p.alignment = WD_ALIGN_PARAGRAPH.CENTER if ci > 0 else WD_ALIGN_PARAGRAPH.LEFT
+                for run in p.runs:
+                    run.font.size = Pt(9)
+
+    # Total row
+    last = len(sorted_nichos) + 1
+    total_camps = sum(s['campaigns'] for s in nicho_stats.values())
+    row_data = ["TOTAL", str(total_camps), f"R${t_cost:,.0f}", f"R${t_rev:,.0f}", f"{t_roas:.2f}"]
+    for ci, val in enumerate(row_data):
+        cell = table.rows[last].cells[ci]
+        cell.text = val
+        for p in cell.paragraphs:
+            p.alignment = WD_ALIGN_PARAGRAPH.CENTER if ci > 0 else WD_ALIGN_PARAGRAPH.LEFT
+            for run in p.runs:
+                run.bold = True
+                run.font.size = Pt(9)
+
+    doc.add_paragraph("")
+
+    # === Por Gestor ===
+    doc.add_heading("Performance por Gestor de Tráfego", level=2)
+
+    sorted_gestores = sorted(gestor_stats.keys(), key=lambda x: -gestor_stats[x]['cost'])
+    table = doc.add_table(rows=2 + len(sorted_gestores), cols=len(headers_n))
+    table.style = "Light Grid Accent 1"
+    table.alignment = WD_TABLE_ALIGNMENT.CENTER
+
+    headers_g = ["Gestor", "Campanhas", "Investido", "Faturamento", "ROAS"]
+    for i, h in enumerate(headers_g):
+        cell = table.rows[0].cells[i]
+        cell.text = h
+        for p in cell.paragraphs:
+            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            for run in p.runs:
+                run.bold = True
+                run.font.size = Pt(9)
+
+    for ri, gestor in enumerate(sorted_gestores):
+        s = gestor_stats[gestor]
+        roas = s['front_rev'] / s['cost'] if s['cost'] > 0 else 0
+        row_data = [gestor, str(s['campaigns']), f"R${s['cost']:,.0f}", f"R${s['front_rev']:,.0f}", f"{roas:.2f}"]
+        for ci, val in enumerate(row_data):
+            cell = table.rows[ri + 1].cells[ci]
+            cell.text = val
+            for p in cell.paragraphs:
+                p.alignment = WD_ALIGN_PARAGRAPH.CENTER if ci > 0 else WD_ALIGN_PARAGRAPH.LEFT
+                for run in p.runs:
+                    run.font.size = Pt(9)
+
+    last = len(sorted_gestores) + 1
+    row_data = ["TOTAL", str(total_camps), f"R${t_cost:,.0f}", f"R${t_rev:,.0f}", f"{t_roas:.2f}"]
+    for ci, val in enumerate(row_data):
+        cell = table.rows[last].cells[ci]
+        cell.text = val
+        for p in cell.paragraphs:
+            p.alignment = WD_ALIGN_PARAGRAPH.CENTER if ci > 0 else WD_ALIGN_PARAGRAPH.LEFT
+            for run in p.runs:
+                run.bold = True
+                run.font.size = Pt(9)
+
+    # === PAGE BREAK ===
+    doc.add_page_break()
+
+    # === Por Gestor Detalhado ===
+    doc.add_heading("Relatório Detalhado por Gestor de Tráfego", level=2)
+
+    gestor_detail = build_gestor_detail(campaigns)
+
+    for gestor in sorted(gestor_detail.keys(), key=lambda x: -gestor_detail[x]['cost']):
+        gd = gestor_detail[gestor]
+        g_roas = gd['front_rev'] / gd['cost'] if gd['cost'] > 0 else 0
+        taxa = gd['validadas'] / gd['total'] * 100 if gd['total'] > 0 else 0
+
+        doc.add_heading(f"{gestor}", level=3)
+
+        # Summary table
+        g_vendas = gd.get('vendas', 0)
+        g_cpa = gd['cost'] / g_vendas if g_vendas > 0 else 0
+        summary_table = doc.add_table(rows=8, cols=2)
+        summary_table.style = "Light Grid Accent 1"
+        summary_data = [
+            ("Campanhas", str(gd['total'])),
+            ("Investimento", f"R${gd['cost']:,.2f}"),
+            ("Faturamento Front", f"R${gd['front_rev']:,.2f}"),
+            ("ROAS Front", f"{g_roas:.2f}"),
+            ("Vendas", str(g_vendas)),
+            ("CPA", f"R${g_cpa:,.0f}" if g_vendas > 0 else "N/A"),
+            ("Validadas (V5: ROAS ≥ 1.8)", f"{gd['validadas']} de {gd['total']} ({taxa:.0f}%)"),
+            ("Negativas (ROAS < 1.0)", str(gd['negativas'])),
+        ]
+        for ri, (label, val) in enumerate(summary_data):
+            summary_table.rows[ri].cells[0].text = label
+            summary_table.rows[ri].cells[1].text = val
+            for p in summary_table.rows[ri].cells[0].paragraphs:
+                for run in p.runs:
+                    run.bold = True
+                    run.font.size = Pt(9)
+            for p in summary_table.rows[ri].cells[1].paragraphs:
+                p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+                for run in p.runs:
+                    run.font.size = Pt(9)
+
+        doc.add_paragraph("")
+
+        # Nicho breakdown
+        doc.add_paragraph("Breakdown por Nicho:").runs[0].bold = True
+        sorted_gn = sorted(gd['nichos'].keys(), key=lambda x: -gd['nichos'][x]['cost'])
+        nt = doc.add_table(rows=1 + len(sorted_gn), cols=5)
+        nt.style = "Light Grid Accent 1"
+        nt.alignment = WD_TABLE_ALIGNMENT.CENTER
+        for i, h in enumerate(["Nicho", "Campanhas", "Investido", "Faturamento", "ROAS"]):
+            nt.rows[0].cells[i].text = h
+            for p in nt.rows[0].cells[i].paragraphs:
+                p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                for run in p.runs:
+                    run.bold = True
+                    run.font.size = Pt(8)
+
+        for ri, sigla in enumerate(sorted_gn):
+            ns = gd['nichos'][sigla]
+            n_roas = ns['front_rev'] / ns['cost'] if ns['cost'] > 0 else 0
+            label = NICHO_NAMES.get(sigla, sigla)
+            status = "✅" if n_roas >= 1.5 else ("⚠️" if n_roas >= 1.0 else "🔴")
+            row_data = [f"{status} {label}", str(ns['camps']), f"R${ns['cost']:,.0f}", f"R${ns['front_rev']:,.0f}", f"{n_roas:.2f}"]
+            for ci, val in enumerate(row_data):
+                nt.rows[ri + 1].cells[ci].text = val
+                for p in nt.rows[ri + 1].cells[ci].paragraphs:
+                    p.alignment = WD_ALIGN_PARAGRAPH.CENTER if ci > 0 else WD_ALIGN_PARAGRAPH.LEFT
+                    for run in p.runs:
+                        run.font.size = Pt(8)
+
+        doc.add_paragraph("")
+
+        # Breakdown por Fonte
+        fonte_stats = defaultdict(lambda: {'cost': 0, 'front_rev': 0, 'camps': 0})
+        for c in gd['campanhas']:
+            f = c.get('fonte', '?')
+            fonte_stats[f]['cost'] += c['cost']
+            fonte_stats[f]['front_rev'] += c['front_rev']
+            fonte_stats[f]['camps'] += 1
+
+        if len(fonte_stats) > 1:
+            doc.add_paragraph("Breakdown por Fonte:").runs[0].bold = True
+            sorted_f = sorted(fonte_stats.keys(), key=lambda x: -fonte_stats[x]['cost'])
+            ft = doc.add_table(rows=1 + len(sorted_f), cols=4)
+            ft.style = "Light Grid Accent 1"
+            ft.alignment = WD_TABLE_ALIGNMENT.CENTER
+            for i, h in enumerate(["Fonte", "Campanhas", "Investido", "ROAS"]):
+                ft.rows[0].cells[i].text = h
+                for p in ft.rows[0].cells[i].paragraphs:
+                    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                    for run in p.runs:
+                        run.bold = True
+                        run.font.size = Pt(8)
+            for ri, fonte in enumerate(sorted_f):
+                fs = fonte_stats[fonte]
+                f_roas = fs['front_rev'] / fs['cost'] if fs['cost'] > 0 else 0
+                row_data = [fonte, str(fs['camps']), f"R${fs['cost']:,.0f}", f"{f_roas:.2f}"]
+                for ci, val in enumerate(row_data):
+                    ft.rows[ri + 1].cells[ci].text = val
+                    for p in ft.rows[ri + 1].cells[ci].paragraphs:
+                        p.alignment = WD_ALIGN_PARAGRAPH.CENTER if ci > 0 else WD_ALIGN_PARAGRAPH.LEFT
+                        for run in p.runs:
+                            run.font.size = Pt(8)
+            doc.add_paragraph("")
+
+        # Top campaigns
+        doc.add_paragraph("Top campanhas:").runs[0].bold = True
+        top = sorted(gd['campanhas'], key=lambda x: -x['front_rev'])[:5]
+        tt = doc.add_table(rows=1 + len(top), cols=4)
+        tt.style = "Light Grid Accent 1"
+        tt.alignment = WD_TABLE_ALIGNMENT.CENTER
+        for i, h in enumerate(["Campanha", "Cost", "Front Rev", "ROAS"]):
+            tt.rows[0].cells[i].text = h
+            for p in tt.rows[0].cells[i].paragraphs:
+                p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                for run in p.runs:
+                    run.bold = True
+                    run.font.size = Pt(8)
+        for ri, c in enumerate(top):
+            status = "✅" if c['roas'] >= 1.5 else ("⚠️" if c['roas'] >= 1.0 else "🔴")
+            row_data = [f"{status} {c['name'][:45]}", f"R${c['cost']:,.0f}", f"R${c['front_rev']:,.0f}", f"{c['roas']:.2f}"]
+            for ci, val in enumerate(row_data):
+                tt.rows[ri + 1].cells[ci].text = val
+                for p in tt.rows[ri + 1].cells[ci].paragraphs:
+                    p.alignment = WD_ALIGN_PARAGRAPH.CENTER if ci > 0 else WD_ALIGN_PARAGRAPH.LEFT
+                    for run in p.runs:
+                        run.font.size = Pt(8)
+
+        doc.add_paragraph("")
+
+    # === PAGE BREAK ===
+    doc.add_page_break()
+
+    # === Rankings ===
+    doc.add_heading("Rankings da Semana", level=2)
+
+    rankings = []
+    for gestor, gd in gestor_detail.items():
+        roas = gd['front_rev'] / gd['cost'] if gd['cost'] > 0 else 0
+        taxa = gd['validadas'] / gd['total'] * 100 if gd['total'] > 0 else 0
+        rankings.append({
+            'gestor': gestor, 'cost': gd['cost'], 'front_rev': gd['front_rev'],
+            'roas': roas, 'testes': gd['total'], 'validadas': gd['validadas'],
+            'negativas': gd['negativas'], 'taxa': taxa,
+        })
+
+    top_testes = max(rankings, key=lambda x: x['testes'])
+    top_fat = max(rankings, key=lambda x: x['front_rev'])
+    top_inv = max(rankings, key=lambda x: x['cost'])
+    top_roas = max(rankings, key=lambda x: x['roas'])
+    top_val = max(rankings, key=lambda x: x['validadas'])
+
+    destaques = [
+        f"📊 Maior volume de testes: {top_testes['gestor']} ({top_testes['testes']} campanhas)",
+        f"💰 Maior faturamento: {top_fat['gestor']} (R${top_fat['front_rev']:,.0f})",
+        f"📈 Maior investimento: {top_inv['gestor']} (R${top_inv['cost']:,.0f})",
+        f"🎯 Melhor ROAS: {top_roas['gestor']} ({top_roas['roas']:.2f})",
+        f"✅ Mais validadas: {top_val['gestor']} ({top_val['validadas']} de {top_val['testes']})",
+    ]
+    for d in destaques:
+        doc.add_paragraph(d, style="List Bullet")
+
+    doc.add_paragraph("")
+    doc.add_heading("Atenção Necessária", level=3)
+
+    has_alert = False
+    for r in rankings:
+        alerts = []
+        if r['roas'] < 1.8:
+            alerts.append(f"ROAS Front abaixo de 1.8 ({r['roas']:.2f})")
+        if r['negativas'] >= 3:
+            alerts.append(f"{r['negativas']} campanhas negativas")
+        if r['taxa'] < 50:
+            alerts.append(f"taxa de validação baixa ({r['taxa']:.0f}%)")
+        if alerts:
+            has_alert = True
+            doc.add_paragraph(f"🔸 {r['gestor']}: {' | '.join(alerts)}", style="List Bullet")
+
+    if not has_alert:
+        doc.add_paragraph("Nenhum gestor com alerta nesta semana.")
+
+    doc.add_paragraph("")
+
+    # Tabela resumo gestores
+    doc.add_heading("Tabela Resumo", level=3)
+    headers_r = ["Gestor", "Testes", "Investido", "Faturamento", "ROAS", "Valid.", "Negat.", "Taxa"]
+    rt = doc.add_table(rows=2 + len(rankings), cols=len(headers_r))
+    rt.style = "Light Grid Accent 1"
+    rt.alignment = WD_TABLE_ALIGNMENT.CENTER
+
+    for i, h in enumerate(headers_r):
+        rt.rows[0].cells[i].text = h
+        for p in rt.rows[0].cells[i].paragraphs:
+            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            for run in p.runs:
+                run.bold = True
+                run.font.size = Pt(8)
+
+    for ri, r in enumerate(sorted(rankings, key=lambda x: -x['cost'])):
+        row_data = [
+            r['gestor'], str(r['testes']), f"R${r['cost']:,.0f}",
+            f"R${r['front_rev']:,.0f}", f"{r['roas']:.2f}",
+            str(r['validadas']), str(r['negativas']), f"{r['taxa']:.0f}%",
+        ]
+        for ci, val in enumerate(row_data):
+            rt.rows[ri + 1].cells[ci].text = val
+            for p in rt.rows[ri + 1].cells[ci].paragraphs:
+                p.alignment = WD_ALIGN_PARAGRAPH.CENTER if ci > 0 else WD_ALIGN_PARAGRAPH.LEFT
+                for run in p.runs:
+                    run.font.size = Pt(8)
+
+    # Total row
+    last_r = len(rankings) + 1
+    tr_testes = sum(r['testes'] for r in rankings)
+    tr_val = sum(r['validadas'] for r in rankings)
+    tr_neg = sum(r['negativas'] for r in rankings)
+    tr_taxa = tr_val / tr_testes * 100 if tr_testes > 0 else 0
+    total_row = ["TOTAL", str(tr_testes), f"R${t_cost:,.0f}", f"R${t_rev:,.0f}", f"{t_roas:.2f}", str(tr_val), str(tr_neg), f"{tr_taxa:.0f}%"]
+    for ci, val in enumerate(total_row):
+        rt.rows[last_r].cells[ci].text = val
+        for p in rt.rows[last_r].cells[ci].paragraphs:
+            p.alignment = WD_ALIGN_PARAGRAPH.CENTER if ci > 0 else WD_ALIGN_PARAGRAPH.LEFT
+            for run in p.runs:
+                run.bold = True
+                run.font.size = Pt(8)
+
+    # Assinatura
+    doc.add_paragraph("")
+    sig = doc.add_paragraph("GPDR — Iago Almeida, assistido por Claude | IMPERA Produtos Naturais")
+    sig.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    for run in sig.runs:
+        run.font.size = Pt(8)
+        run.font.color.rgb = RGBColor(0x99, 0x99, 0x99)
+    sig2 = doc.add_paragraph("Regras: Super Cérebro de Tráfego V5 | ROAS = Front (revenuetype2 + revenuetype3)")
+    sig2.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    for run in sig2.runs:
+        run.font.size = Pt(7)
+        run.font.color.rgb = RGBColor(0xBB, 0xBB, 0xBB)
+
+    return doc
+
+
+def build_gestor_docx(gestor, campaigns, date_from, date_to,
+                      prev_gd=None, prev_date_from=None, prev_date_to=None):
+    """Build individual report for a single gestor."""
+    from docx import Document
+    from docx.shared import Pt, RGBColor
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.enum.table import WD_TABLE_ALIGNMENT
+
+    doc = Document()
+    style = doc.styles["Normal"]
+    style.font.name = "Calibri"
+    style.font.size = Pt(10)
+
+    df = datetime.strptime(date_from, '%Y-%m-%d').strftime('%d.%m')
+    dt = datetime.strptime(date_to, '%Y-%m-%d').strftime('%d.%m')
+
+    t = doc.add_heading(f"Relatório Individual — {gestor} [{df} a {dt}]", level=1)
+    t.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+    gd = build_gestor_detail(campaigns).get(gestor, None)
+    if not gd or gd['total'] == 0:
+        doc.add_paragraph("Nenhuma campanha encontrada para este gestor neste período.")
+        return doc
+
+    g_roas = gd['front_rev'] / gd['cost'] if gd['cost'] > 0 else 0
+    taxa = gd['validadas'] / gd['total'] * 100 if gd['total'] > 0 else 0
+
+    doc.add_paragraph(
+        f"Investimento: R${gd['cost']:,.0f} | "
+        f"Faturamento Front: R${gd['front_rev']:,.0f} | "
+        f"ROAS: {g_roas:.2f} | "
+        f"Gerado em {datetime.now().strftime('%d/%m/%Y %H:%M')}"
+    )
+
+    # === COMPARATIVO SEMANAL ===
+    if prev_gd is not None:
+        empty_gd = {'cost': 0, 'front_rev': 0, 'total': 0, 'validadas': 0, 'negativas': 0, 'nichos': {}}
+        add_gestor_comparison(doc, gestor, gd, prev_gd if prev_gd else empty_gd,
+                              prev_date_from, prev_date_to)
+
+    # === Resumo KPIs ===
+    doc.add_heading("Resumo de Performance", level=2)
+
+    vendas_total = gd.get('vendas', 0)
+    cpa = gd['cost'] / vendas_total if vendas_total > 0 else 0
+    summary_table = doc.add_table(rows=9, cols=2)
+    summary_table.style = "Light Grid Accent 1"
+    summary_data = [
+        ("Campanhas", str(gd['total'])),
+        ("Investimento", f"R${gd['cost']:,.2f}"),
+        ("Faturamento Front", f"R${gd['front_rev']:,.2f}"),
+        ("ROAS Front", f"{g_roas:.2f}"),
+        ("Vendas", str(vendas_total)),
+        ("CPA", f"R${cpa:,.0f}" if vendas_total > 0 else "N/A"),
+        ("Fontes", ", ".join(sorted(gd.get('fontes', set()))) or "N/A"),
+        ("Validadas (V5: ROAS ≥ 1.8)", f"{gd['validadas']} de {gd['total']} ({taxa:.0f}%)"),
+        ("Negativas (ROAS < 1.0)", str(gd['negativas'])),
+    ]
+    for ri, (label, val) in enumerate(summary_data):
+        summary_table.rows[ri].cells[0].text = label
+        summary_table.rows[ri].cells[1].text = val
+        for p in summary_table.rows[ri].cells[0].paragraphs:
+            for run in p.runs:
+                run.bold = True
+                run.font.size = Pt(9)
+        for p in summary_table.rows[ri].cells[1].paragraphs:
+            p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+            for run in p.runs:
+                run.font.size = Pt(9)
+
+    doc.add_paragraph("")
+
+    # === Breakdown por Nicho ===
+    doc.add_heading("Breakdown por Nicho", level=2)
+    sorted_gn = sorted(gd['nichos'].keys(), key=lambda x: -gd['nichos'][x]['cost'])
+    nt = doc.add_table(rows=1 + len(sorted_gn), cols=5)
+    nt.style = "Light Grid Accent 1"
+    nt.alignment = WD_TABLE_ALIGNMENT.CENTER
+    for i, h in enumerate(["Nicho", "Campanhas", "Investido", "Faturamento", "ROAS"]):
+        nt.rows[0].cells[i].text = h
+        for p in nt.rows[0].cells[i].paragraphs:
+            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            for run in p.runs:
+                run.bold = True
+                run.font.size = Pt(8)
+
+    for ri, sigla in enumerate(sorted_gn):
+        ns = gd['nichos'][sigla]
+        n_roas = ns['front_rev'] / ns['cost'] if ns['cost'] > 0 else 0
+        label = NICHO_NAMES.get(sigla, sigla)
+        status = "✅" if n_roas >= 1.5 else ("⚠️" if n_roas >= 1.0 else "🔴")
+        row_data = [f"{status} {label}", str(ns['camps']), f"R${ns['cost']:,.0f}", f"R${ns['front_rev']:,.0f}", f"{n_roas:.2f}"]
+        for ci, val in enumerate(row_data):
+            nt.rows[ri + 1].cells[ci].text = val
+            for p in nt.rows[ri + 1].cells[ci].paragraphs:
+                p.alignment = WD_ALIGN_PARAGRAPH.CENTER if ci > 0 else WD_ALIGN_PARAGRAPH.LEFT
+                for run in p.runs:
+                    run.font.size = Pt(8)
+
+    doc.add_paragraph("")
+
+    # === Breakdown por Fonte ===
+    if gd.get('fontes'):
+        doc.add_heading("Breakdown por Fonte de Tráfego", level=2)
+        fonte_stats = defaultdict(lambda: {'cost': 0, 'front_rev': 0, 'vendas': 0, 'camps': 0})
+        for c in [camp for camp in campaigns if camp['gestor'] == gestor]:
+            f = c.get('fonte', '?')
+            fonte_stats[f]['cost'] += c['cost']
+            fonte_stats[f]['front_rev'] += c['front_rev']
+            fonte_stats[f]['vendas'] += c.get('vendas', 0)
+            fonte_stats[f]['camps'] += 1
+
+        sorted_fontes = sorted(fonte_stats.keys(), key=lambda x: -fonte_stats[x]['cost'])
+        ft = doc.add_table(rows=1 + len(sorted_fontes), cols=6)
+        ft.style = "Light Grid Accent 1"
+        ft.alignment = WD_TABLE_ALIGNMENT.CENTER
+        for i, h in enumerate(["Fonte", "Campanhas", "Investido", "Faturamento", "ROAS", "Vendas"]):
+            ft.rows[0].cells[i].text = h
+            for p in ft.rows[0].cells[i].paragraphs:
+                p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                for run in p.runs:
+                    run.bold = True
+                    run.font.size = Pt(8)
+
+        for ri, fonte in enumerate(sorted_fontes):
+            fs = fonte_stats[fonte]
+            f_roas = fs['front_rev'] / fs['cost'] if fs['cost'] > 0 else 0
+            status = "✅" if f_roas >= 1.8 else ("⚠️" if f_roas >= 1.0 else "🔴")
+            row_data = [f"{status} {fonte}", str(fs['camps']), f"R${fs['cost']:,.0f}", f"R${fs['front_rev']:,.0f}", f"{f_roas:.2f}", str(fs['vendas'])]
+            for ci, val in enumerate(row_data):
+                ft.rows[ri + 1].cells[ci].text = val
+                for p in ft.rows[ri + 1].cells[ci].paragraphs:
+                    p.alignment = WD_ALIGN_PARAGRAPH.CENTER if ci > 0 else WD_ALIGN_PARAGRAPH.LEFT
+                    for run in p.runs:
+                        run.font.size = Pt(8)
+
+        doc.add_paragraph("")
+
+    # === Classificação das campanhas ===
+    doc.add_page_break()
+    doc.add_heading("Campanhas por Classificação", level=2)
+
+    gestor_camps = [c for c in campaigns if c['gestor'] == gestor]
+    classifications = ['🏆 Top / Escala', '✅ Validado', '🟡 Pré-validado', '🔵 Em Teste', '🔴 Negativa']
+
+    for cls in classifications:
+        group = [c for c in gestor_camps if c['classificacao'] == cls]
+        if not group:
+            continue
+
+        gc = sum(c['cost'] for c in group)
+        gr = sum(c['front_rev'] for c in group)
+        groas = gr / gc if gc > 0 else 0
+
+        doc.add_heading(f"{cls} — {len(group)} campanhas | R${gc:,.0f} invest. | ROAS {groas:.2f}", level=3)
+
+        headers = ["Campanha", "Nicho", "Cost", "Front Rev", "ROAS"]
+        table = doc.add_table(rows=1 + len(group), cols=len(headers))
+        table.style = "Light Grid Accent 1"
+        table.alignment = WD_TABLE_ALIGNMENT.CENTER
+
+        for i, h in enumerate(headers):
+            cell = table.rows[0].cells[i]
+            cell.text = h
+            for p in cell.paragraphs:
+                p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                for run in p.runs:
+                    run.bold = True
+                    run.font.size = Pt(8)
+
+        for ri, c in enumerate(group):
+            nicho_label = NICHO_NAMES.get(c['nicho'], c['nicho'])
+            row_data = [
+                c['name'][:55],
+                nicho_label,
+                f"R${c['cost']:,.0f}",
+                f"R${c['front_rev']:,.0f}",
+                f"{c['roas']:.2f}",
+            ]
+            for ci, val in enumerate(row_data):
+                cell = table.rows[ri + 1].cells[ci]
+                cell.text = val
+                for p in cell.paragraphs:
+                    p.alignment = WD_ALIGN_PARAGRAPH.CENTER if ci > 0 else WD_ALIGN_PARAGRAPH.LEFT
+                    for run in p.runs:
+                        run.font.size = Pt(8)
+                        if ci == 4:
+                            roas_val = c['roas']
+                            if roas_val >= 2.0:
+                                run.font.color.rgb = RGBColor(0x12, 0xa5, 0x94)
+                            elif roas_val < 1.0:
+                                run.font.color.rgb = RGBColor(0xe5, 0x48, 0x4d)
+
+        doc.add_paragraph("")
+
+    # === Top 10 campanhas ===
+    doc.add_page_break()
+    doc.add_heading("Top 10 Campanhas por Faturamento", level=2)
+    top = sorted(gestor_camps, key=lambda x: -x['front_rev'])[:10]
+    tt = doc.add_table(rows=1 + len(top), cols=5)
+    tt.style = "Light Grid Accent 1"
+    tt.alignment = WD_TABLE_ALIGNMENT.CENTER
+    for i, h in enumerate(["Campanha", "Nicho", "Cost", "Front Rev", "ROAS"]):
+        tt.rows[0].cells[i].text = h
+        for p in tt.rows[0].cells[i].paragraphs:
+            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            for run in p.runs:
+                run.bold = True
+                run.font.size = Pt(8)
+    for ri, c in enumerate(top):
+        status = "✅" if c['roas'] >= 1.5 else ("⚠️" if c['roas'] >= 1.0 else "🔴")
+        nicho_label = NICHO_NAMES.get(c['nicho'], c['nicho'])
+        row_data = [f"{status} {c['name'][:50]}", nicho_label, f"R${c['cost']:,.0f}", f"R${c['front_rev']:,.0f}", f"{c['roas']:.2f}"]
+        for ci, val in enumerate(row_data):
+            tt.rows[ri + 1].cells[ci].text = val
+            for p in tt.rows[ri + 1].cells[ci].paragraphs:
+                p.alignment = WD_ALIGN_PARAGRAPH.CENTER if ci > 0 else WD_ALIGN_PARAGRAPH.LEFT
+                for run in p.runs:
+                    run.font.size = Pt(8)
+
+    # Assinatura
+    doc.add_paragraph("")
+    sig = doc.add_paragraph("GPDR — Iago Almeida, assistido por Claude | IMPERA Produtos Naturais")
+    sig.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    for run in sig.runs:
+        run.font.size = Pt(8)
+        run.font.color.rgb = RGBColor(0x99, 0x99, 0x99)
+    sig2 = doc.add_paragraph("Regras: Super Cérebro de Tráfego V5 | ROAS = Front (revenuetype2 + revenuetype3)")
+    sig2.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    for run in sig2.runs:
+        run.font.size = Pt(7)
+        run.font.color.rgb = RGBColor(0xBB, 0xBB, 0xBB)
+
+    return doc
+
+
+def docx_to_pdf(docx_path, pdf_path):
+    """Convert .docx to .pdf via textutil + Chrome headless."""
+    html_path = docx_path.replace('.docx', '.html')
+    subprocess.run(["textutil", "-convert", "html", "-output", html_path, docx_path],
+                   check=True, capture_output=True)
+    subprocess.run([
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        "--headless", "--disable-gpu", f"--print-to-pdf={pdf_path}",
+        "--no-margins", html_path
+    ], check=True, capture_output=True)
+    os.remove(html_path)
+
+
+def persist_to_database(campaigns, date_from, date_to):
+    """
+    Persiste dados de performance no PostgreSQL (Data Lake).
+    Substitui a geracao de .docx/.pdf como destino primario dos dados.
+    Cada campanha gera 1 linha na fact_performance_redtrack por dia do periodo.
+    """
+    if not DB_AVAILABLE:
+        print("  ⚠️ Database nao disponivel, pulando persistencia")
+        return 0
+
+    if not os.getenv('DATABASE_URL'):
+        print("  ⚠️ DATABASE_URL nao configurada, pulando persistencia")
+        return 0
+
+    rows = []
+    for c in campaigns:
+        # Mapear gestor para formato padrao
+        gestor = c.get('gestor', '?')
+        if gestor == '?':
+            continue
+
+        rows.append({
+            'data_registro': date_to,  # ultimo dia do periodo
+            'gestor': gestor,
+            'nome_ad_rt': c.get('name', ''),
+            'custo': round(c.get('cost', 0), 2),
+            'fat_front': round(c.get('front_rev', 0), 2),
+            'vendas': int(c.get('vendas', 0)),
+        })
+
+    if not rows:
+        print("  Nenhuma campanha para persistir")
+        return 0
+
+    df = pd.DataFrame(rows)
+    df['data_registro'] = pd.to_datetime(df['data_registro']).dt.date
+
+    try:
+        n = inserir_dados(df, 'fact_performance_redtrack')
+        print(f"  ✅ {n} linhas inseridas no Data Lake (fact_performance_redtrack)")
+        return n
+    except Exception as e:
+        print(f"  ❌ Erro ao inserir no Data Lake: {e}")
+        return 0
+
+
+def main():
+    if not REDTRACK_API_KEY:
+        print("ERRO: REDTRACK_API_KEY não configurado")
+        return
+
+    # Fetch current week
+    date_from, date_to = get_week_range()
+    print(f"Buscando dados da semana atual [{date_from} a {date_to}]...")
+    data = api_get(date_from, date_to)
+    items = data if isinstance(data, list) else data.get('items', [])
+    print(f"  {len(items)} campanhas encontradas")
+    campaigns = process_campaigns(items)
+
+    # Fetch previous week
+    prev_date_from, prev_date_to = get_prev_week_range()
+    print(f"Buscando dados da semana anterior [{prev_date_from} a {prev_date_to}]...")
+    prev_data = api_get(prev_date_from, prev_date_to)
+    prev_items = prev_data if isinstance(prev_data, list) else prev_data.get('items', [])
+    print(f"  {len(prev_items)} campanhas encontradas (semana anterior)")
+    prev_campaigns = process_campaigns(prev_items)
+
+    # Aggregate
+    nicho_stats, gestor_stats, totals = aggregate_stats(campaigns)
+
+    # ============================================================
+    # DATA LAKE: Persistir no PostgreSQL (destino primario)
+    # ============================================================
+    print("\n=== Persistindo no Data Lake ===")
+    persist_to_database(campaigns, date_from, date_to)
+
+    # ============================================================
+    # LEGADO: Geracao .docx/.pdf (desativada — dados agora no banco)
+    # Para reativar temporariamente, descomente o bloco abaixo.
+    # ============================================================
+    # print("Gerando relatório principal .docx...")
+    # doc = build_docx(campaigns, nicho_stats, gestor_stats, date_from, date_to, totals,
+    #                  prev_campaigns=prev_campaigns, prev_date_from=prev_date_from,
+    #                  prev_date_to=prev_date_to)
+    #
+    # today_str = datetime.now().strftime("%d%m")
+    # output_path = os.path.join(OUTPUT_DIR, f"Relatorio_Performance_RedTrack_{today_str}.docx")
+    # try:
+    #     doc.save(output_path)
+    # except PermissionError:
+    #     ts = datetime.now().strftime("%H%M%S")
+    #     output_path = os.path.join(OUTPUT_DIR, f"Relatorio_Performance_RedTrack_{today_str}_{ts}.docx")
+    #     doc.save(output_path)
+    # print(f"Relatório principal salvo: {output_path}")
+    #
+    # pdf_path = output_path.replace('.docx', '.pdf')
+    # try:
+    #     docx_to_pdf(output_path, pdf_path)
+    #     print(f"PDF principal salvo: {pdf_path}")
+    # except Exception as e:
+    #     print(f"  Aviso: conversão PDF falhou ({e})")
+    #
+    # # Individual gestor reports
+    # prev_gestor_detail = build_gestor_detail(prev_campaigns)
+    # curr_gestor_detail = build_gestor_detail(campaigns)
+    # gestores_dir = os.path.join(OUTPUT_DIR, f"RedTrack_Gestores_{today_str}")
+    # os.makedirs(gestores_dir, exist_ok=True)
+    # for gestor in sorted(curr_gestor_detail.keys()):
+    #     if gestor == '?':
+    #         continue
+    #     gestor_safe = gestor.replace(' ', '_').replace('/', '_')
+    #     prev_gd = prev_gestor_detail.get(gestor, {'cost': 0, 'front_rev': 0, 'total': 0,
+    #                                                 'validadas': 0, 'negativas': 0, 'nichos': {}})
+    #     gestor_doc = build_gestor_docx(gestor, campaigns, date_from, date_to,
+    #                                     prev_gd=prev_gd, prev_date_from=prev_date_from,
+    #                                     prev_date_to=prev_date_to)
+    #     gestor_docx = os.path.join(gestores_dir, f"Relatorio_{gestor_safe}_{today_str}.docx")
+    #     gestor_doc.save(gestor_docx)
+    #     try:
+    #         docx_to_pdf(gestor_docx, gestor_docx.replace('.docx', '.pdf'))
+    #     except Exception:
+    #         pass
+
+    print(f"\n✅ Concluido! Dados persistidos no Data Lake.")
+    print(f"   Consultar: SELECT * FROM impera.view_performance_financeira")
+
+
+if __name__ == "__main__":
+    main()

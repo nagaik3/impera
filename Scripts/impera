@@ -1,0 +1,185 @@
+#!/bin/bash
+# IMPERA Context Manager — cd impera + context setup
+# Usage: impera [command]
+# Commands: dev, data, scripts, help
+
+set -e
+
+# Colors
+GREEN='\033[0;32m'
+BLUE='\033[0;34m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
+
+IMPERA_HOME="$HOME/impera-core"
+IMPERA_DATA="$HOME/Scripts/data"
+IMPERA_SCRIPTS="$HOME/Scripts"
+IMPERA_DOCS="$HOME/Obsidian/IMPERA"
+
+# Default context
+CONTEXT_DIR="${IMPERA_DATA}"
+
+show_banner() {
+    clear
+    cat << 'EOF'
+╔════════════════════════════════════════════════════════════════╗
+║                    IMPERA CONTEXT                              ║
+║              Grupo IMPERA Produtos Naturais                    ║
+╚════════════════════════════════════════════════════════════════╝
+EOF
+    echo ""
+}
+
+show_help() {
+    cat << 'EOF'
+IMPERA Context Manager
+
+USAGE:
+  impera              — Enter IMPERA data context (default)
+  impera dev          — Enter IMPERA development (impera-core)
+  impera scripts      — Enter IMPERA scripts directory
+  impera docs         — Enter IMPERA documentation (Obsidian)
+  impera status       — Show IMPERA system status
+  impera help         — Show this help
+
+DIRECTORIES:
+  Data:      ~/Scripts/data/
+  Scripts:   ~/Scripts/
+  Docs:      ~/Obsidian/IMPERA/
+  Dev:       ~/impera-core/
+
+CONTEXT INCLUDES:
+  ✓ IMPERA environment variables (API tokens, etc)
+  ✓ ClickUp API v2 configuration
+  ✓ RedTrack API access
+  ✓ Path to IMPERA documentation
+  ✓ Quick access to analysis files
+
+QUICK COMMANDS (inside impera context):
+  cdata       — List analysis files in ~/Scripts/data/
+  c           — Change to ~/Scripts/data/
+  cscripts    — Change to ~/Scripts/
+  cdocs       — Change to ~/Obsidian/IMPERA/
+
+ENVIRONMENT VARIABLES SET:
+  $IMPERA_HOME        — impera-core repository
+  $IMPERA_DATA        — Analysis data directory
+  $IMPERA_SCRIPTS     — Scripts directory
+  $IMPERA_DOCS        — Documentation directory
+  $CLICKUP_API_TOKEN  — ClickUp API token
+  $REDTRACK_API_KEY   — RedTrack API key
+
+EOF
+}
+
+show_status() {
+    echo "${BLUE}═══════════════════════════════════════════════════${NC}"
+    echo "${GREEN}IMPERA SYSTEM STATUS${NC}"
+    echo "${BLUE}═══════════════════════════════════════════════════${NC}"
+    echo ""
+
+    # Check directories
+    echo "📁 Directories:"
+    for dir in "$IMPERA_HOME" "$IMPERA_DATA" "$IMPERA_SCRIPTS" "$IMPERA_DOCS"; do
+        if [ -d "$dir" ]; then
+            echo "  ✅ $(basename $dir): $dir"
+        else
+            echo "  ❌ $(basename $dir): NOT FOUND"
+        fi
+    done
+
+    echo ""
+    echo "📊 Latest Analysis Files:"
+    if [ -d "$IMPERA_DATA" ]; then
+        ls -1t "$IMPERA_DATA"/*.md 2>/dev/null | head -5 | sed 's|.*||; s|^|  • |'
+    fi
+
+    echo ""
+    echo "🔐 API Configuration:"
+    if [ -n "$CLICKUP_API_TOKEN" ]; then
+        echo "  ✅ ClickUp API Token: ${CLICKUP_API_TOKEN:0:10}..."
+    else
+        echo "  ❌ ClickUp API Token: NOT SET"
+    fi
+
+    if [ -n "$REDTRACK_API_KEY" ]; then
+        echo "  ✅ RedTrack API Key: SET"
+    else
+        echo "  ❌ RedTrack API Key: NOT SET"
+    fi
+
+    echo ""
+}
+
+enter_context() {
+    show_banner
+
+    local dir="$1"
+    local name="${2:-IMPERA Data}"
+
+    echo "${GREEN}✓ Entering IMPERA context: $name${NC}"
+    echo "${BLUE}Directory:${NC} $dir"
+    echo ""
+
+    # Export environment variables
+    export IMPERA_HOME
+    export IMPERA_DATA
+    export IMPERA_SCRIPTS
+    export IMPERA_DOCS
+    export IMPERA_CONTEXT="$name"
+
+    # Add quick aliases for this shell session
+    alias cdata="cd $IMPERA_DATA"
+    alias c="cd $IMPERA_DATA"
+    alias cscripts="cd $IMPERA_SCRIPTS"
+    alias cdocs="cd $IMPERA_DOCS"
+    alias impera-status="clear && impera status"
+
+    echo "${YELLOW}Quick Aliases (this session):${NC}"
+    echo "  c              → cd $IMPERA_DATA"
+    echo "  cdata          → cd $IMPERA_DATA"
+    echo "  cscripts       → cd $IMPERA_SCRIPTS"
+    echo "  cdocs          → cd $IMPERA_DOCS"
+    echo "  impera-status  → Show IMPERA status"
+    echo ""
+
+    echo "${YELLOW}Documentation:${NC}"
+    echo "  📚 Complete:   $IMPERA_DATA/SESSAO_GESTORES_2026_05_21_COMPLETA.md"
+    echo "  ⚡ Quick Ref:  $IMPERA_DATA/GUIA_RAPIDO_NOMENCLATURA_CONTAGEM.md"
+    echo "  📑 Index:      $IMPERA_DATA/INDICE_SESSAO_2026_05_21.md"
+    echo ""
+
+    # Change directory
+    cd "$dir"
+
+    echo "${GREEN}Ready to work with IMPERA!${NC}"
+    echo ""
+}
+
+# Main logic
+case "${1:-}" in
+    "dev")
+        enter_context "$IMPERA_HOME" "IMPERA Development"
+        ;;
+    "scripts")
+        enter_context "$IMPERA_SCRIPTS" "IMPERA Scripts"
+        ;;
+    "docs")
+        enter_context "$IMPERA_DOCS" "IMPERA Documentation"
+        ;;
+    "status")
+        show_status
+        ;;
+    "help"|"-h"|"--help")
+        show_help
+        ;;
+    "")
+        enter_context "$IMPERA_DATA" "IMPERA Data Analysis"
+        ;;
+    *)
+        echo "❌ Unknown command: $1"
+        echo ""
+        echo "Try: impera help"
+        exit 1
+        ;;
+esac

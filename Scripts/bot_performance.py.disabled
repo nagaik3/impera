@@ -1,0 +1,1914 @@
+#!/usr/bin/env python3
+"""
+Bot IMPERA Performance — Telegram
+Alertas proativos, comandos interativos com seletor de periodo,
+auto reports (08:30 e 16:00), checagem horaria.
+
+Uso:
+  python3 bot_performance.py bot       # Bot interativo (long-polling)
+  python3 bot_performance.py morning   # Auto report 08:30
+  python3 bot_performance.py afternoon # Auto report 16:00
+  python3 bot_performance.py check     # Checagem horaria de alertas
+"""
+
+import os
+import sys
+import json
+import re
+import time as _time
+import urllib.request
+from datetime import datetime, timedelta
+from collections import defaultdict
+
+sys.path.insert(0, os.path.expanduser("~/Scripts"))
+from cruzamento_clickup_redtrack import (
+    parse_campaign_name, fetch_redtrack_campaigns, fetch_redtrack_adgroups,
+    build_clickup_data, build_redtrack_data,
+    OFERTA_PADRAO, NICHO_KEYWORDS, GESTOR_MAP,
+)
+from impera_utils import get_cf_value, detect_nicho
+
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_PERF_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+REDTRACK_KEY = os.environ.get("REDTRACK_API_KEY", "")
+CLICKUP_TOKEN = os.environ.get("CLICKUP_API_TOKEN", "")
+
+OFFSET_FILE = os.path.expanduser("~/Scripts/data/perf_bot_offset.txt")
+LAST_REPORT_FILE = os.path.expanduser("~/Scripts/data/perf_last_report.json")
+
+# Periodos disponiveis
+PERIODOS = {
+    "24h": 1,
+    "48h": 2,
+    "7d": 7,
+    "15d": 15,
+    "30d": 30,
+}
+
+PERIODO_LABELS = {
+    "24h": "Ultimo dia",
+    "48h": "Ultimos 2 dias",
+    "7d": "Ultimos 7 dias",
+    "15d": "Ultimos 15 dias",
+    "30d": "Ultimos 30 dias",
+}
+
+# Estado para "Digitar datas" — chat_id -> {"command": ..., "extra": ...}
+_pending_custom_period = {}
+
+# Comandos que precisam de seletor de periodo
+COMMANDS_WITH_PERIOD = {
+    "performance", "campanhas", "gestores", "copywriters",
+    "criativos", "oferta", "gestor", "fonte", "comparativo",
+    "validacao",
+}
+
+# Bot start time (para /status)
+BOT_START_TIME = None
+
+# ============================================================
+# CONFIG — constantes centralizadas
+# ============================================================
+
+CONFIG = {
+    "MIN_COST_DISPLAY": 10,        # Custo mínimo para mostrar em relatórios
+    "MIN_COST_ALERT": 100,         # Custo mínimo para avaliar alertas
+    "MIN_COST_CRITICAL": 500,      # Gasto sem venda — threshold alertas
+    "MIN_COST_HOURLY": 1000,       # Gasto sem venda — threshold horário
+    "ROAS_FRONT_MIN": 1.8,         # ROAS Front mínimo (Super Cérebro V5)
+    "ROAS_WARNING": 1.5,           # ROAS para alerta de atenção
+    "ROAS_CRITICAL": 1.0,          # ROAS crítico (negativo efetivo)
+    "ROAS_GOOD": 2.0,              # ROAS bom
+    "DROP_RATIO": 0.7,             # Queda de 30% = alerta
+    "CPA_META": 180,               # CPA máximo (V5)
+    "CACHE_TTL": 300,              # Cache TTL em segundos
+}
+
+
+def calc_roas(revenue, cost):
+    """Calcula ROAS de forma segura."""
+    return revenue / cost if cost > 0 else 0
+
+
+def calc_cpa(cost, vendas):
+    """Calcula CPA de forma segura."""
+    return cost / vendas if vendas > 0 else 0
+
+
+def build_oferta_key(campaign):
+    """Constrói chave de oferta a partir de uma campanha."""
+    key = f"{campaign.get('nicho', '?')} | {campaign.get('oferta', '?')}"
+    if campaign.get("mercado") == "EUA":
+        key += " (EUA)"
+    return key
+
+
+# ============================================================
+# CACHE SIMPLES COM TTL
+# ============================================================
+
+_cache = {}
+_CACHE_TTL = 300  # 5 minutos
+
+
+def cache_get(key):
+    """Retorna dado do cache se ainda valido, senao None."""
+    if key in _cache:
+        data, ts = _cache[key]
+        if _time.time() - ts < _CACHE_TTL:
+            return data
+        del _cache[key]
+    return None
+
+
+def cache_set(key, data):
+    """Salva dado no cache com timestamp."""
+    _cache[key] = (data, _time.time())
+
+
+def cache_clear():
+    """Limpa todo o cache."""
+    _cache.clear()
+
+
+# ============================================================
+# TELEGRAM HELPERS
+# ============================================================
+
+def tg_request(method, data=None):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/{method}"
+    body = json.dumps(data).encode() if data else None
+    req = urllib.request.Request(url, data=body, method="POST")
+    req.add_header("Content-Type", "application/json")
+    with urllib.request.urlopen(req, timeout=35) as resp:
+        return json.loads(resp.read())
+
+
+def send_msg(chat_id, text, reply_markup=None, parse_mode=None):
+    """Envia mensagem, divide se > 4000 chars."""
+    chunks = []
+    if len(text) <= 4000:
+        chunks = [text]
+    else:
+        lines = text.split("\n")
+        current = ""
+        for line in lines:
+            if len(current) + len(line) + 1 > 4000:
+                chunks.append(current)
+                current = line
+            else:
+                current += ("\n" + line) if current else line
+        if current:
+            chunks.append(current)
+
+    for i, chunk in enumerate(chunks):
+        payload = {"chat_id": chat_id, "text": chunk, "disable_web_page_preview": True}
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
+        # Inline keyboard so na ultima chunk
+        if reply_markup and i == len(chunks) - 1:
+            payload["reply_markup"] = reply_markup
+        try:
+            tg_request("sendMessage", payload)
+        except Exception as e:
+            # Se falhar com parse_mode, tenta sem formatacao
+            if parse_mode:
+                payload.pop("parse_mode", None)
+                tg_request("sendMessage", payload)
+            else:
+                raise e
+
+
+def send_period_selector(chat_id, command, extra=""):
+    """Envia seletor de periodo com inline buttons."""
+    keyboard = {
+        "inline_keyboard": [
+            [
+                {"text": "24h", "callback_data": f"{command}|24h|{extra}"},
+                {"text": "48h", "callback_data": f"{command}|48h|{extra}"},
+                {"text": "7 dias", "callback_data": f"{command}|7d|{extra}"},
+            ],
+            [
+                {"text": "15 dias", "callback_data": f"{command}|15d|{extra}"},
+                {"text": "30 dias", "callback_data": f"{command}|30d|{extra}"},
+            ],
+            [
+                {"text": "Personalizar", "callback_data": f"custom_period|{command}|{extra}"},
+            ],
+        ]
+    }
+    send_msg(chat_id, f"Selecione o periodo:", reply_markup=keyboard)
+
+
+def send_custom_period_selector(chat_id, command, extra=""):
+    """Envia seletor de periodo customizado com presets inteligentes."""
+    now = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    yesterday = now - timedelta(days=1)
+
+    # Semana atual (segunda ate ontem)
+    this_week_start = now - timedelta(days=now.weekday())
+    # Se hoje e segunda, semana atual = so hoje (nada pra mostrar), pula
+    show_this_week = yesterday >= this_week_start
+
+    # Semana passada (seg-dom)
+    last_week_end = this_week_start - timedelta(days=1)
+    last_week_start = last_week_end - timedelta(days=6)
+
+    # Este mes (dia 1 ate ontem)
+    this_month_start = now.replace(day=1)
+
+    # Mes passado
+    last_month_end = this_month_start - timedelta(days=1)
+    last_month_start = last_month_end.replace(day=1)
+
+    def fd(d):
+        return d.strftime("%Y%m%d")
+
+    def fl(d):
+        return d.strftime("%d/%m")
+
+    rows = []
+
+    if show_this_week:
+        rows.append([{
+            "text": f"Sem. atual ({fl(this_week_start)}-{fl(yesterday)})",
+            "callback_data": f"{command}|{fd(this_week_start)}_{fd(yesterday)}|{extra}",
+        }])
+
+    rows.append([{
+        "text": f"Sem. passada ({fl(last_week_start)}-{fl(last_week_end)})",
+        "callback_data": f"{command}|{fd(last_week_start)}_{fd(last_week_end)}|{extra}",
+    }])
+
+    rows.append([{
+        "text": f"Este mes ({fl(this_month_start)}-{fl(yesterday)})",
+        "callback_data": f"{command}|{fd(this_month_start)}_{fd(yesterday)}|{extra}",
+    }])
+
+    rows.append([{
+        "text": f"Mes passado ({fl(last_month_start)}-{fl(last_month_end)})",
+        "callback_data": f"{command}|{fd(last_month_start)}_{fd(last_month_end)}|{extra}",
+    }])
+
+    rows.append([{
+        "text": "Digitar datas...",
+        "callback_data": f"custom_type|{command}|{extra}",
+    }])
+
+    keyboard = {"inline_keyboard": rows}
+    send_msg(chat_id, "Selecione o periodo:", reply_markup=keyboard)
+
+
+def answer_callback(callback_id):
+    """Responde callback query."""
+    try:
+        tg_request("answerCallbackQuery", {"callback_query_id": callback_id})
+    except Exception:
+        pass
+
+
+# ============================================================
+# DATA FETCHERS (com cache e tratamento de erro)
+# ============================================================
+
+def get_dates(period_key, live=False):
+    """Retorna (date_from, date_to) como strings YYYY-MM-DD.
+
+    Periodos padrao (24h, 48h, 7d, etc.):
+      live=False (default): dias completos terminando em ontem
+      live=True: tempo real incluindo hoje (para auto reports)
+
+    Periodo customizado: period_key no formato "YYYYMMDD_YYYYMMDD"
+    """
+    # Custom: "20260414_20260420"
+    if "_" in period_key and len(period_key) == 17:
+        d1 = datetime.strptime(period_key[:8], "%Y%m%d")
+        d2 = datetime.strptime(period_key[9:], "%Y%m%d")
+        return d1.strftime("%Y-%m-%d"), d2.strftime("%Y-%m-%d")
+
+    days = PERIODOS.get(period_key, 7)
+    today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+
+    if live:
+        date_to = today.strftime("%Y-%m-%d")
+        date_from = (today - timedelta(days=days)).strftime("%Y-%m-%d")
+    else:
+        yesterday = today - timedelta(days=1)
+        date_to = yesterday.strftime("%Y-%m-%d")
+        date_from = (yesterday - timedelta(days=days - 1)).strftime("%Y-%m-%d")
+
+    return date_from, date_to
+
+
+def get_period_label(period_key):
+    """Retorna label legivel para o periodo, incluindo datas."""
+    if "_" in period_key and len(period_key) == 17:
+        d1 = datetime.strptime(period_key[:8], "%Y%m%d")
+        d2 = datetime.strptime(period_key[9:], "%Y%m%d")
+        return f"{d1.strftime('%d/%m')} a {d2.strftime('%d/%m')}"
+
+    label = PERIODO_LABELS.get(period_key, period_key)
+    date_from, date_to = get_dates(period_key)
+    df = datetime.strptime(date_from, "%Y-%m-%d").strftime("%d/%m")
+    dt = datetime.strptime(date_to, "%Y-%m-%d").strftime("%d/%m")
+    if df == dt:
+        return f"{label} ({df})"
+    return f"{label} ({df} a {dt})"
+
+
+def fetch_campaigns(period_key, use_cache=True, live=False):
+    """Busca campanhas do RedTrack com cache."""
+    cache_key = f"campaigns_{period_key}{'_live' if live else ''}"
+    if use_cache:
+        cached = cache_get(cache_key)
+        if cached is not None:
+            return cached
+
+    date_from, date_to = get_dates(period_key, live=live)
+    raw = fetch_redtrack_campaigns(date_from, date_to)
+    campaigns = []
+    for r in raw:
+        name = r.get("campaign", "")
+        cost = float(r.get("cost", 0))
+        rev = float(r.get("revenuetype2", 0)) + float(r.get("revenuetype3", 0))
+        vendas = int(r.get("convtype1", 0))
+        clicks = int(r.get("clicks", 0))
+        parsed = parse_campaign_name(name)
+        campaigns.append({
+            "name": name, "campaign_id": r.get("campaign_id", ""),
+            "cost": cost, "revenue": rev,
+            "roas": rev / cost if cost > 0 else 0,
+            "vendas": vendas, "clicks": clicks,
+            **parsed,
+        })
+
+    cache_set(cache_key, campaigns)
+    return campaigns
+
+
+def fetch_clickup_cached():
+    """Busca tarefas do ClickUp com cache."""
+    cached = cache_get("clickup_tasks")
+    if cached is not None:
+        return cached
+    tasks = build_clickup_data()
+    cache_set("clickup_tasks", tasks)
+    return tasks
+
+
+def safe_command(chat_id, fn, *args, **kwargs):
+    """Wrapper que captura erros e avisa o usuario."""
+    try:
+        fn(chat_id, *args, **kwargs)
+    except Exception as e:
+        send_msg(chat_id, f"Erro ao executar comando: {e}")
+        print(f"[{datetime.now().isoformat()}] Erro em {fn.__name__}: {e}")
+
+
+def fmt(val):
+    """Formata numero."""
+    if val >= 1000:
+        return f"R${val:,.0f}"
+    return f"R${val:.0f}"
+
+
+def roas_status(roas):
+    if roas >= CONFIG["ROAS_GOOD"]:
+        return "OK"
+    if roas >= CONFIG["ROAS_WARNING"]:
+        return "!!"
+    if roas >= CONFIG["ROAS_CRITICAL"]:
+        return "XX"
+    return "NEG"
+
+
+def roas_icon(roas):
+    if roas >= CONFIG["ROAS_GOOD"]:
+        return "+"
+    if roas >= CONFIG["ROAS_WARNING"]:
+        return "~"
+    if roas >= CONFIG["ROAS_CRITICAL"]:
+        return "-"
+    return "!!"
+
+
+# ============================================================
+# COMMAND HANDLERS
+# ============================================================
+
+def cmd_performance(chat_id, period_key):
+    send_msg(chat_id, "Buscando dados de performance...")
+    campaigns = fetch_campaigns(period_key)
+    ofertas = defaultdict(lambda: {"cost": 0, "revenue": 0, "vendas": 0, "campanhas": 0})
+    for c in campaigns:
+        if not c["nicho"] or not c["oferta"]:
+            continue
+        key = build_oferta_key(c)
+        ofertas[key]["cost"] += c["cost"]
+        ofertas[key]["revenue"] += c["revenue"]
+        ofertas[key]["vendas"] += c["vendas"]
+        ofertas[key]["campanhas"] += 1
+
+    total_rev = sum(d["revenue"] for d in ofertas.values())
+    total_cost = sum(d["cost"] for d in ofertas.values())
+    total_roas = calc_roas(total_rev, total_cost)
+
+    lines = [f"PERFORMANCE GERAL | {get_period_label(period_key)}\n"]
+    lines.append(f"Receita total: {fmt(total_rev)} | Custo: {fmt(total_cost)} | ROAS: {total_roas:.2f}\n")
+
+    sorted_of = sorted(ofertas.items(), key=lambda x: x[1]["revenue"], reverse=True)
+    for key, d in sorted_of:
+        if d["cost"] < CONFIG["MIN_COST_DISPLAY"]:
+            continue
+        roas = calc_roas(d["revenue"], d["cost"])
+        cpa = calc_cpa(d["cost"], d["vendas"])
+        icon = roas_icon(roas)
+        lines.append(
+            f"[{icon}] {key}\n"
+            f"  Receita: {fmt(d['revenue'])} | Custo: {fmt(d['cost'])} | ROAS: {roas:.2f}\n"
+            f"  Vendas: {d['vendas']} | CPA: {fmt(cpa)} | Camps: {d['campanhas']}"
+        )
+
+    save_last_report("performance", "\n".join(lines))
+    send_msg(chat_id, "\n".join(lines))
+
+
+def cmd_campanhas(chat_id, period_key):
+    send_msg(chat_id, "Buscando campanhas...")
+    campaigns = fetch_campaigns(period_key)
+    active = [c for c in campaigns if c["cost"] > CONFIG["MIN_COST_DISPLAY"]]
+    active.sort(key=lambda x: x["revenue"], reverse=True)
+
+    lines = [f"CAMPANHAS | {get_period_label(period_key)}\n"]
+    lines.append(f"Total: {len(active)} campanhas ativas\n")
+
+    for c in active[:20]:
+        icon = roas_icon(c["roas"])
+        gestor = c.get("gestor") or "?"
+        short_name = c["name"][:45]
+        lines.append(
+            f"[{icon}] {short_name}\n"
+            f"  Receita: {fmt(c['revenue'])} | Custo: {fmt(c['cost'])} | ROAS: {c['roas']:.2f}\n"
+            f"  Vendas: {c['vendas']} | Gestor: {gestor}"
+        )
+
+    if len(active) > 20:
+        lines.append(f"\n+{len(active) - 20} campanhas omitidas")
+
+    save_last_report("campanhas", "\n".join(lines))
+    send_msg(chat_id, "\n".join(lines))
+
+
+def cmd_gestores(chat_id, period_key):
+    send_msg(chat_id, "Buscando dados de gestores...")
+    campaigns = fetch_campaigns(period_key)
+    gestores = defaultdict(lambda: {"cost": 0, "revenue": 0, "vendas": 0, "campanhas": 0, "nichos": set()})
+
+    sem_gestor = {"cost": 0, "revenue": 0, "campanhas": 0}
+    for c in campaigns:
+        g = c.get("gestor")
+        if not g:
+            sem_gestor["cost"] += c["cost"]
+            sem_gestor["revenue"] += c["revenue"]
+            sem_gestor["campanhas"] += 1
+            continue
+        gestores[g]["cost"] += c["cost"]
+        gestores[g]["revenue"] += c["revenue"]
+        gestores[g]["vendas"] += c["vendas"]
+        gestores[g]["campanhas"] += 1
+        if c.get("nicho"):
+            gestores[g]["nichos"].add(c["nicho"])
+
+    lines = [f"GESTORES DE TRAFEGO | {get_period_label(period_key)}\n"]
+    sorted_g = sorted(gestores.items(), key=lambda x: x[1]["revenue"], reverse=True)
+
+    for g, d in sorted_g:
+        if d["cost"] < CONFIG["MIN_COST_DISPLAY"]:
+            continue
+        roas = calc_roas(d["revenue"], d["cost"])
+        cpa = calc_cpa(d["cost"], d["vendas"])
+        icon = roas_icon(roas)
+        nichos = ", ".join(sorted(d["nichos"]))
+        lines.append(
+            f"[{icon}] {g} ({d['campanhas']} camps)\n"
+            f"  Receita: {fmt(d['revenue'])} | Custo: {fmt(d['cost'])} | ROAS: {roas:.2f}\n"
+            f"  Vendas: {d['vendas']} | CPA: {fmt(cpa)}\n"
+            f"  Nichos: {nichos}"
+        )
+
+    # Campanhas sem gestor identificado
+    if sem_gestor["cost"] > CONFIG["MIN_COST_DISPLAY"]:
+        lines.append(
+            f"\n[?] Sem gestor identificado: {sem_gestor['campanhas']} camps | "
+            f"Custo: {fmt(sem_gestor['cost'])} | Receita: {fmt(sem_gestor['revenue'])}"
+        )
+
+    save_last_report("gestores", "\n".join(lines))
+    send_msg(chat_id, "\n".join(lines))
+
+
+def cmd_gestor(chat_id, period_key, gestor_filter):
+    """Performance detalhada de um gestor especifico."""
+    send_msg(chat_id, f"Buscando dados do gestor {gestor_filter}...")
+    campaigns = fetch_campaigns(period_key)
+
+    # Filtra campanhas do gestor (busca parcial, case-insensitive)
+    filtro = gestor_filter.upper()
+    filtered = [c for c in campaigns if filtro in (c.get("gestor") or "").upper()]
+
+    if not filtered:
+        send_msg(chat_id, f"Nenhuma campanha encontrada para o gestor '{gestor_filter}'.")
+        return
+
+    total_rev = sum(c["revenue"] for c in filtered)
+    total_cost = sum(c["cost"] for c in filtered)
+    total_roas = total_rev / total_cost if total_cost > 0 else 0
+    total_vendas = sum(c["vendas"] for c in filtered)
+
+    gestor_nome = filtered[0].get("gestor") or gestor_filter
+    nichos = set()
+    ofertas_data = defaultdict(lambda: {"cost": 0, "revenue": 0, "vendas": 0})
+
+    for c in filtered:
+        if c.get("nicho"):
+            nichos.add(c["nicho"])
+        key = build_oferta_key(c)
+        ofertas_data[key]["cost"] += c["cost"]
+        ofertas_data[key]["revenue"] += c["revenue"]
+        ofertas_data[key]["vendas"] += c["vendas"]
+
+    lines = [f"GESTOR: {gestor_nome} | {get_period_label(period_key)}\n"]
+    lines.append(f"Campanhas: {len(filtered)} | Nichos: {', '.join(sorted(nichos))}")
+    cpa = total_cost / total_vendas if total_vendas > 0 else 0
+    lines.append(f"Receita: {fmt(total_rev)} | Custo: {fmt(total_cost)} | ROAS: {total_roas:.2f}")
+    lines.append(f"Vendas: {total_vendas} | CPA: {fmt(cpa)}\n")
+
+    # Breakdown por oferta
+    lines.append("Por oferta:")
+    for key, d in sorted(ofertas_data.items(), key=lambda x: x[1]["revenue"], reverse=True):
+        if d["cost"] < CONFIG["MIN_COST_DISPLAY"]:
+            continue
+        roas = d["revenue"] / d["cost"] if d["cost"] > 0 else 0
+        icon = roas_icon(roas)
+        lines.append(f"  [{icon}] {key}: {fmt(d['revenue'])} | ROAS {roas:.2f} | Vendas {d['vendas']}")
+
+    # Top campanhas do gestor
+    filtered.sort(key=lambda x: x["revenue"], reverse=True)
+    lines.append(f"\nTop campanhas:")
+    for c in filtered[:10]:
+        if c["cost"] < CONFIG["MIN_COST_DISPLAY"]:
+            continue
+        icon = roas_icon(c["roas"])
+        lines.append(f"  [{icon}] {c['name'][:45]}\n    {fmt(c['revenue'])} | ROAS {c['roas']:.2f} | Vendas {c['vendas']}")
+
+    save_last_report(f"gestor_{gestor_nome}", "\n".join(lines))
+    send_msg(chat_id, "\n".join(lines))
+
+
+def cmd_oferta(chat_id, period_key, nicho_filter):
+    """Performance detalhada de uma oferta/nicho especifico."""
+    send_msg(chat_id, f"Buscando dados da oferta {nicho_filter}...")
+    campaigns = fetch_campaigns(period_key)
+
+    filtro = nicho_filter.upper()
+    filtered = [c for c in campaigns if filtro in (c.get("nicho") or "").upper()
+                or filtro in (c.get("oferta") or "").upper()]
+
+    if not filtered:
+        send_msg(chat_id, f"Nenhuma campanha encontrada para '{nicho_filter}'.")
+        return
+
+    total_rev = sum(c["revenue"] for c in filtered)
+    total_cost = sum(c["cost"] for c in filtered)
+    total_roas = total_rev / total_cost if total_cost > 0 else 0
+    total_vendas = sum(c["vendas"] for c in filtered)
+
+    # Agrupa por oferta (pode ter mais de uma no mesmo nicho)
+    ofertas = defaultdict(lambda: {"cost": 0, "revenue": 0, "vendas": 0, "campanhas": 0})
+    gestores = defaultdict(lambda: {"cost": 0, "revenue": 0, "vendas": 0})
+    for c in filtered:
+        of_key = c.get("oferta") or "?"
+        if c.get("mercado") == "EUA":
+            of_key += " (EUA)"
+        ofertas[of_key]["cost"] += c["cost"]
+        ofertas[of_key]["revenue"] += c["revenue"]
+        ofertas[of_key]["vendas"] += c["vendas"]
+        ofertas[of_key]["campanhas"] += 1
+        g = c.get("gestor") or "?"
+        gestores[g]["cost"] += c["cost"]
+        gestores[g]["revenue"] += c["revenue"]
+        gestores[g]["vendas"] += c["vendas"]
+
+    lines = [f"OFERTA: {filtro} | {get_period_label(period_key)}\n"]
+    cpa = total_cost / total_vendas if total_vendas > 0 else 0
+    lines.append(f"Receita: {fmt(total_rev)} | Custo: {fmt(total_cost)} | ROAS: {total_roas:.2f}")
+    lines.append(f"Vendas: {total_vendas} | CPA: {fmt(cpa)} | Campanhas: {len(filtered)}\n")
+
+    # Breakdown por oferta
+    if len(ofertas) > 1:
+        lines.append("Por produto:")
+        for key, d in sorted(ofertas.items(), key=lambda x: x[1]["revenue"], reverse=True):
+            roas = d["revenue"] / d["cost"] if d["cost"] > 0 else 0
+            icon = roas_icon(roas)
+            lines.append(f"  [{icon}] {key}: {fmt(d['revenue'])} | ROAS {roas:.2f} | {d['campanhas']} camps")
+        lines.append("")
+
+    # Gestores operando esse nicho
+    lines.append("Por gestor:")
+    for g, d in sorted(gestores.items(), key=lambda x: x[1]["revenue"], reverse=True):
+        if d["cost"] < CONFIG["MIN_COST_DISPLAY"]:
+            continue
+        roas = d["revenue"] / d["cost"] if d["cost"] > 0 else 0
+        icon = roas_icon(roas)
+        lines.append(f"  [{icon}] {g}: {fmt(d['revenue'])} | ROAS {roas:.2f} | Vendas {d['vendas']}")
+
+    # Top campanhas
+    filtered.sort(key=lambda x: x["revenue"], reverse=True)
+    lines.append(f"\nTop campanhas:")
+    for c in filtered[:10]:
+        if c["cost"] < CONFIG["MIN_COST_DISPLAY"]:
+            continue
+        icon = roas_icon(c["roas"])
+        g = c.get("gestor") or "?"
+        lines.append(f"  [{icon}] {c['name'][:45]}\n    {fmt(c['revenue'])} | ROAS {c['roas']:.2f} | Gestor: {g}")
+
+    save_last_report(f"oferta_{filtro}", "\n".join(lines))
+    send_msg(chat_id, "\n".join(lines))
+
+
+def cmd_copywriters(chat_id, period_key):
+    send_msg(chat_id, "Buscando dados de copywriters (ClickUp + RedTrack)...")
+    campaigns = fetch_campaigns(period_key)
+    tasks = fetch_clickup_cached()
+
+    camp_by_nf = defaultdict(lambda: {"cost": 0, "revenue": 0, "vendas": 0})
+    for c in campaigns:
+        if not c["nicho"] or not c["fonte"]:
+            continue
+        camp_by_nf[(c["nicho"], c["fonte"])]["cost"] += c["cost"]
+        camp_by_nf[(c["nicho"], c["fonte"])]["revenue"] += c["revenue"]
+        camp_by_nf[(c["nicho"], c["fonte"])]["vendas"] += c["vendas"]
+
+    copy_tasks = defaultdict(lambda: defaultdict(int))
+    for t in tasks:
+        cw = t.get("copywriter", "N/A")
+        if cw == "N/A" or not t.get("nicho") or not t.get("fonte"):
+            continue
+        count = len(t.get("ads", [])) or 1
+        copy_tasks[cw][(t["nicho"], t["fonte"])] += count
+
+    copy_perf = defaultdict(lambda: {"rev": 0, "cost": 0, "vendas": 0, "criativos": 0})
+    for cw, nf_counts in copy_tasks.items():
+        for (nicho, fonte), count in nf_counts.items():
+            total_nf = sum(copy_tasks[c].get((nicho, fonte), 0) for c in copy_tasks)
+            if total_nf == 0:
+                continue
+            share = count / total_nf
+            perf = camp_by_nf.get((nicho, fonte))
+            if not perf:
+                continue
+            copy_perf[cw]["rev"] += perf["revenue"] * share
+            copy_perf[cw]["cost"] += perf["cost"] * share
+            copy_perf[cw]["vendas"] += perf["vendas"] * share
+            copy_perf[cw]["criativos"] += count
+
+    lines = [f"RANKING COPYWRITERS | {get_period_label(period_key)}\n"]
+    sorted_c = sorted(copy_perf.items(), key=lambda x: x[1]["rev"], reverse=True)
+
+    for cw, d in sorted_c:
+        if d["cost"] < CONFIG["MIN_COST_DISPLAY"]:
+            continue
+        roas = d["rev"] / d["cost"] if d["cost"] > 0 else 0
+        icon = roas_icon(roas)
+        lines.append(
+            f"[{icon}] {cw} ({d['criativos']} criativos)\n"
+            f"  Receita attr: {fmt(d['rev'])} | Custo attr: {fmt(d['cost'])} | ROAS: {roas:.2f}\n"
+            f"  Vendas attr: {d['vendas']:.0f}"
+        )
+
+    save_last_report("copywriters", "\n".join(lines))
+    send_msg(chat_id, "\n".join(lines))
+
+
+def cmd_criativos(chat_id, period_key):
+    send_msg(chat_id, "Buscando criativos...")
+    date_from, date_to = get_dates(period_key)
+    campaigns = fetch_campaigns(period_key)
+    tasks = fetch_clickup_cached()
+
+    # Usar cache compartilhado (1 call vs N+1)
+    from impera_cache import cached_rt_adgroups
+    rt_data = cached_rt_adgroups(date_from, date_to, ttl=600)
+    all_ags_raw = rt_data["adgroups"]
+
+    all_ag = []
+    for ag in all_ags_raw:
+        cost = float(ag.get("cost", 0))
+        rev = float(ag.get("revenuetype2", 0)) + float(ag.get("revenuetype3", 0))
+        if cost < 5:
+            continue
+        cname = ag.get("campaign", "")
+        parsed = parse_campaign_name(cname)
+        all_ag.append({
+            "name": ag.get("rt_adgroup", ""),
+            "cost": cost, "revenue": rev,
+            "roas": calc_roas(rev, cost),
+            "nicho": parsed.get("nicho"), "fonte": parsed.get("fonte"),
+        })
+
+    # Simple match with tasks
+    RIP_COPY = {"CE": "ELIAS", "CY": "YAN", "CC": "CASSIO"}
+
+    def find_match(ag):
+        ag_clean = re.sub(r"\s*[-—]\s*(C[oó]pia|Copy)(\s*\d*)?$", "", ag["name"], flags=re.IGNORECASE).strip().upper()
+        for t in tasks:
+            if t.get("nicho") != ag["nicho"]:
+                continue
+            ad_m = re.search(r"AD\s*(\d+)", ag_clean)
+            if ad_m and f"AD{int(ad_m.group(1))}" in t.get("all_ids", []):
+                return t
+            for px in ["CE", "CY", "CC"]:
+                rip_m = re.match(rf"^{px}\s*(\d+)", ag_clean)
+                if rip_m and f"{px}{int(rip_m.group(1))}" in t.get("all_ids", []):
+                    return t
+        return None
+
+    all_ag.sort(key=lambda x: x["revenue"], reverse=True)
+
+    lines = [f"TOP CRIATIVOS | {get_period_label(period_key)}\n"]
+    for ag in all_ag[:20]:
+        match = find_match(ag)
+        icon = roas_icon(ag["roas"])
+        name_short = ag["name"][:45]
+        if match:
+            lines.append(
+                f"[{icon}] {name_short}\n"
+                f"  Receita: {fmt(ag['revenue'])} | Custo: {fmt(ag['cost'])} | ROAS: {ag['roas']:.2f}\n"
+                f"  Copy: {match.get('copywriter','?')} | Editor: {match.get('editor','?')}"
+            )
+        else:
+            # Infer copy from prefix
+            ag_upper = ag["name"].upper().strip()
+            inferred = None
+            for px, cp in RIP_COPY.items():
+                if re.match(rf"^{px}\s*\d+", ag_upper):
+                    inferred = cp
+                    break
+            copy_info = f" | Copy inferido: {inferred}" if inferred else ""
+            lines.append(
+                f"[{icon}] {name_short}\n"
+                f"  Receita: {fmt(ag['revenue'])} | Custo: {fmt(ag['cost'])} | ROAS: {ag['roas']:.2f}{copy_info}"
+            )
+
+    save_last_report("criativos", "\n".join(lines))
+    send_msg(chat_id, "\n".join(lines))
+
+
+def cmd_fonte(chat_id, period_key):
+    """Performance por fonte de trafego (FB, GG, YT, TT, etc.)."""
+    send_msg(chat_id, "Buscando dados por fonte de trafego...")
+    campaigns = fetch_campaigns(period_key)
+    label = get_period_label(period_key)
+
+    fontes = defaultdict(lambda: {
+        "cost": 0, "revenue": 0, "vendas": 0, "campanhas": 0, "nichos": set(),
+    })
+
+    for c in campaigns:
+        f = c.get("fonte") or "N/A"
+        fontes[f]["cost"] += c["cost"]
+        fontes[f]["revenue"] += c["revenue"]
+        fontes[f]["vendas"] += c["vendas"]
+        fontes[f]["campanhas"] += 1
+        if c.get("nicho"):
+            fontes[f]["nichos"].add(c["nicho"])
+
+    total_rev = sum(d["revenue"] for d in fontes.values())
+    total_cost = sum(d["cost"] for d in fontes.values())
+    total_roas = total_rev / total_cost if total_cost > 0 else 0
+
+    lines = [f"FONTES DE TRAFEGO | {label}\n"]
+    lines.append(f"Receita total: {fmt(total_rev)} | Custo: {fmt(total_cost)} | ROAS: {total_roas:.2f}\n")
+
+    sorted_f = sorted(fontes.items(), key=lambda x: x[1]["revenue"], reverse=True)
+    for f, d in sorted_f:
+        if d["cost"] < CONFIG["MIN_COST_DISPLAY"]:
+            continue
+        roas = d["revenue"] / d["cost"] if d["cost"] > 0 else 0
+        cpa = d["cost"] / d["vendas"] if d["vendas"] > 0 else 0
+        icon = roas_icon(roas)
+        share = (d["revenue"] / total_rev * 100) if total_rev > 0 else 0
+        nichos = ", ".join(sorted(d["nichos"]))
+        lines.append(
+            f"[{icon}] {f} ({share:.0f}% da receita)\n"
+            f"  Receita: {fmt(d['revenue'])} | Custo: {fmt(d['cost'])} | ROAS: {roas:.2f}\n"
+            f"  Vendas: {d['vendas']} | CPA: {fmt(cpa)} | Camps: {d['campanhas']}\n"
+            f"  Nichos: {nichos}"
+        )
+
+    save_last_report("fonte", "\n".join(lines))
+    send_msg(chat_id, "\n".join(lines))
+
+
+def cmd_comparativo(chat_id, period_key):
+    """Comparativo: periodo selecionado vs periodo anterior equivalente."""
+    send_msg(chat_id, "Buscando dados comparativos...")
+    label_atual = get_period_label(period_key)
+
+    # Calcular periodo anterior equivalente
+    date_from, date_to = get_dates(period_key)
+    d_from = datetime.strptime(date_from, "%Y-%m-%d")
+    d_to = datetime.strptime(date_to, "%Y-%m-%d")
+    duration = (d_to - d_from).days + 1
+    prev_to = d_from - timedelta(days=1)
+    prev_from = prev_to - timedelta(days=duration - 1)
+    prev_key = f"{prev_from.strftime('%Y%m%d')}_{prev_to.strftime('%Y%m%d')}"
+    label_prev = get_period_label(prev_key)
+    # Nota: comparativo usa período anterior equivalente (ex: 7d atual vs 7d anterior)
+
+    campaigns_atual = fetch_campaigns(period_key)
+    campaigns_prev = fetch_campaigns(prev_key)
+
+    def aggregate(camps):
+        total = {"cost": 0, "revenue": 0, "vendas": 0}
+        ofertas = defaultdict(lambda: {"cost": 0, "revenue": 0, "vendas": 0})
+        gestores = defaultdict(lambda: {"cost": 0, "revenue": 0, "vendas": 0})
+        for c in camps:
+            total["cost"] += c["cost"]
+            total["revenue"] += c["revenue"]
+            total["vendas"] += c["vendas"]
+            if c.get("nicho") and c.get("oferta"):
+                key = build_oferta_key(c)
+                ofertas[key]["cost"] += c["cost"]
+                ofertas[key]["revenue"] += c["revenue"]
+                ofertas[key]["vendas"] += c["vendas"]
+            g = c.get("gestor") or "N/A"
+            gestores[g]["cost"] += c["cost"]
+            gestores[g]["revenue"] += c["revenue"]
+            gestores[g]["vendas"] += c["vendas"]
+        return total, ofertas, gestores
+
+    atual, of_atual, g_atual = aggregate(campaigns_atual)
+    prev, of_prev, g_prev = aggregate(campaigns_prev)
+
+    def delta_pct(new, old):
+        if old == 0:
+            return "+100%" if new > 0 else "0%"
+        pct = ((new - old) / old) * 100
+        return f"+{pct:.0f}%" if pct >= 0 else f"{pct:.0f}%"
+
+    def delta_icon(new, old):
+        if new > old:
+            return "^"
+        if new < old:
+            return "v"
+        return "="
+
+    roas_a = calc_roas(atual["revenue"], atual["cost"])
+    roas_p = calc_roas(prev["revenue"], prev["cost"])
+
+    lines = [f"COMPARATIVO\n"]
+    lines.append(f"Atual: {label_atual}")
+    lines.append(f"Anterior: {label_prev}\n")
+
+    # Totais
+    lines.append("GERAL:")
+    lines.append(
+        f"  Receita: {fmt(atual['revenue'])} ({delta_pct(atual['revenue'], prev['revenue'])}) "
+        f"| era {fmt(prev['revenue'])}"
+    )
+    lines.append(
+        f"  Custo: {fmt(atual['cost'])} ({delta_pct(atual['cost'], prev['cost'])}) "
+        f"| era {fmt(prev['cost'])}"
+    )
+    lines.append(
+        f"  ROAS: {roas_a:.2f} ({delta_pct(roas_a, roas_p)}) | era {roas_p:.2f}"
+    )
+    lines.append(
+        f"  Vendas: {atual['vendas']} ({delta_pct(atual['vendas'], prev['vendas'])}) "
+        f"| era {prev['vendas']}"
+    )
+
+    # Por oferta (top 10 por receita atual)
+    lines.append(f"\nPOR OFERTA:")
+    all_ofertas = set(list(of_atual.keys()) + list(of_prev.keys()))
+    oferta_rows = []
+    for key in all_ofertas:
+        a = of_atual.get(key, {"cost": 0, "revenue": 0, "vendas": 0})
+        p = of_prev.get(key, {"cost": 0, "revenue": 0, "vendas": 0})
+        if a["cost"] < CONFIG["MIN_COST_DISPLAY"] and p["cost"] < CONFIG["MIN_COST_DISPLAY"]:
+            continue
+        roas_oa = calc_roas(a["revenue"], a["cost"])
+        roas_op = calc_roas(p["revenue"], p["cost"])
+        oferta_rows.append((key, a, p, roas_oa, roas_op))
+
+    oferta_rows.sort(key=lambda x: x[1]["revenue"], reverse=True)
+    for key, a, p, roas_oa, roas_op in oferta_rows[:10]:
+        di = delta_icon(a["revenue"], p["revenue"])
+        lines.append(
+            f"  [{di}] {key}\n"
+            f"    Receita: {fmt(a['revenue'])} ({delta_pct(a['revenue'], p['revenue'])}) "
+            f"| ROAS: {roas_oa:.2f} (era {roas_op:.2f})\n"
+            f"    Vendas: {a['vendas']} ({delta_pct(a['vendas'], p['vendas'])})"
+        )
+
+    # Por gestor (top)
+    lines.append(f"\nPOR GESTOR:")
+    all_gestores = set(list(g_atual.keys()) + list(g_prev.keys()))
+    gestor_rows = []
+    for g in all_gestores:
+        if g == "N/A":
+            continue
+        a = g_atual.get(g, {"cost": 0, "revenue": 0, "vendas": 0})
+        p = g_prev.get(g, {"cost": 0, "revenue": 0, "vendas": 0})
+        if a["cost"] < CONFIG["MIN_COST_DISPLAY"] and p["cost"] < CONFIG["MIN_COST_DISPLAY"]:
+            continue
+        roas_ga = calc_roas(a["revenue"], a["cost"])
+        roas_gp = calc_roas(p["revenue"], p["cost"])
+        gestor_rows.append((g, a, p, roas_ga, roas_gp))
+
+    gestor_rows.sort(key=lambda x: x[1]["revenue"], reverse=True)
+    for g, a, p, roas_ga, roas_gp in gestor_rows:
+        di = delta_icon(a["revenue"], p["revenue"])
+        lines.append(
+            f"  [{di}] {g}: {fmt(a['revenue'])} ({delta_pct(a['revenue'], p['revenue'])}) "
+            f"| ROAS {roas_ga:.2f} (era {roas_gp:.2f})"
+        )
+
+    save_last_report("comparativo", "\n".join(lines))
+    send_msg(chat_id, "\n".join(lines))
+
+
+def cmd_alertas(chat_id):
+    """Alertas ativos: ROAS < 1.5, quedas dia-a-dia, gasto sem venda."""
+    send_msg(chat_id, "Verificando alertas...")
+    campaigns_24h = fetch_campaigns("24h", live=True)
+    campaigns_48h = fetch_campaigns("48h", live=True)
+
+    lines = ["ALERTAS ATIVOS\n"]
+    alerts_found = False
+
+    # 1. Ofertas com ROAS < 1.5 (24h)
+    ofertas_hoje = defaultdict(lambda: {"cost": 0, "revenue": 0, "vendas": 0})
+    for c in campaigns_24h:
+        if c["nicho"] and c["oferta"]:
+            key = build_oferta_key(c)
+            ofertas_hoje[key]["cost"] += c["cost"]
+            ofertas_hoje[key]["revenue"] += c["revenue"]
+            ofertas_hoje[key]["vendas"] += c["vendas"]
+
+    roas_alerts = []
+    for key, d in ofertas_hoje.items():
+        if d["cost"] < CONFIG["MIN_COST_ALERT"]:
+            continue
+        roas = d["revenue"] / d["cost"] if d["cost"] > 0 else 0
+        if roas < CONFIG["ROAS_WARNING"]:
+            roas_alerts.append((key, d, roas))
+
+    if roas_alerts:
+        alerts_found = True
+        roas_alerts.sort(key=lambda x: x[2])
+        lines.append("ROAS ABAIXO DE 1.5:")
+        for key, d, roas in roas_alerts:
+            lines.append(
+                f"  [!!] {key}\n"
+                f"    ROAS: {roas:.2f} | Receita: {fmt(d['revenue'])} | Custo: {fmt(d['cost'])}"
+            )
+        lines.append("")
+
+    # 2. Comparativo 48h vs 24h — detecta quedas de ROAS
+    ofertas_48h = defaultdict(lambda: {"cost": 0, "revenue": 0})
+    for c in campaigns_48h:
+        if c["nicho"] and c["oferta"]:
+            key = build_oferta_key(c)
+            ofertas_48h[key]["cost"] += c["cost"]
+            ofertas_48h[key]["revenue"] += c["revenue"]
+
+    quedas = []
+    for key, d_48 in ofertas_48h.items():
+        if d_48["cost"] < CONFIG["MIN_COST_ALERT"] * 2:
+            continue
+        roas_48 = d_48["revenue"] / d_48["cost"] if d_48["cost"] > 0 else 0
+        d_24 = ofertas_hoje.get(key)
+        if not d_24 or d_24["cost"] < 50:
+            continue
+        roas_24 = d_24["revenue"] / d_24["cost"] if d_24["cost"] > 0 else 0
+        if roas_48 > 0 and roas_24 < roas_48 * CONFIG["DROP_RATIO"]:
+            quedas.append((key, roas_48, roas_24))
+
+    if quedas:
+        alerts_found = True
+        quedas.sort(key=lambda x: x[2])
+        lines.append("QUEDAS DE ROAS (24h vs 48h):")
+        for key, roas_48, roas_24 in quedas:
+            pct = ((roas_24 - roas_48) / roas_48) * 100
+            lines.append(f"  [!!] {key}: {roas_48:.2f} -> {roas_24:.2f} ({pct:.0f}%)")
+        lines.append("")
+
+    # 3. Campanhas com gasto > R$500 e zero vendas
+    gasto_sem_venda = []
+    for c in campaigns_24h:
+        if c["cost"] >= CONFIG["MIN_COST_CRITICAL"] and c["vendas"] == 0:
+            gasto_sem_venda.append(c)
+
+    if gasto_sem_venda:
+        alerts_found = True
+        gasto_sem_venda.sort(key=lambda x: x["cost"], reverse=True)
+        lines.append("GASTO SEM VENDA (>R$500):")
+        for c in gasto_sem_venda[:5]:
+            g = c.get("gestor") or "?"
+            lines.append(
+                f"  [!!] {c['name'][:50]}\n"
+                f"    Custo: {fmt(c['cost'])} | Vendas: 0 | Gestor: {g}"
+            )
+        lines.append("")
+
+    if not alerts_found:
+        lines.append("Nenhum alerta ativo no momento.")
+
+    save_last_report("alertas", "\n".join(lines))
+    send_msg(chat_id, "\n".join(lines))
+
+
+def cmd_resumo(chat_id):
+    """Resumo rapido do dia — sempre 24h live, sem seletor."""
+    send_msg(chat_id, "Gerando resumo do dia...")
+    campaigns = fetch_campaigns("24h", live=True)
+
+    total_rev = sum(c["revenue"] for c in campaigns)
+    total_cost = sum(c["cost"] for c in campaigns)
+    total_roas = total_rev / total_cost if total_cost > 0 else 0
+    total_vendas = sum(c["vendas"] for c in campaigns)
+
+    lines = [f"RESUMO DO DIA | {datetime.now().strftime('%d/%m/%Y %H:%M')}\n"]
+    cpa = total_cost / total_vendas if total_vendas > 0 else 0
+    lines.append(f"Receita: {fmt(total_rev)} | Custo: {fmt(total_cost)} | ROAS: {total_roas:.2f}")
+    lines.append(f"Vendas CC: {total_vendas} | CPA: {fmt(cpa)}\n")
+
+    # Top ofertas
+    ofertas = defaultdict(lambda: {"cost": 0, "revenue": 0, "vendas": 0})
+    for c in campaigns:
+        if c["nicho"] and c["oferta"]:
+            key = build_oferta_key(c)
+            ofertas[key]["cost"] += c["cost"]
+            ofertas[key]["revenue"] += c["revenue"]
+            ofertas[key]["vendas"] += c["vendas"]
+
+    lines.append("Ofertas:")
+    for key, d in sorted(ofertas.items(), key=lambda x: x[1]["revenue"], reverse=True):
+        if d["cost"] < CONFIG["MIN_COST_DISPLAY"]:
+            continue
+        roas = d["revenue"] / d["cost"] if d["cost"] > 0 else 0
+        icon = roas_icon(roas)
+        lines.append(f"  [{icon}] {key}: {fmt(d['revenue'])} | ROAS {roas:.2f} | Vendas {d['vendas']}")
+
+    # Alertas rapidos
+    alertas = []
+    for key, d in ofertas.items():
+        roas = d["revenue"] / d["cost"] if d["cost"] > 0 else 0
+        if roas < CONFIG["ROAS_WARNING"] and d["cost"] > CONFIG["MIN_COST_ALERT"] * 2:
+            alertas.append(f"  [!!] {key}: ROAS {roas:.2f}")
+    for c in campaigns:
+        if c["cost"] >= CONFIG["MIN_COST_CRITICAL"] and c["vendas"] == 0:
+            alertas.append(f"  [!!] Gasto sem venda: {c['name'][:35]} | {fmt(c['cost'])}")
+
+    if alertas:
+        lines.append(f"\nAlertas ({len(alertas)}):")
+        lines.extend(alertas[:5])
+
+    save_last_report("resumo", "\n".join(lines))
+    send_msg(chat_id, "\n".join(lines))
+
+
+def cmd_status(chat_id):
+    """Status do bot — health check."""
+    now = datetime.now()
+    uptime = ""
+    if BOT_START_TIME:
+        delta = now - BOT_START_TIME
+        hours = int(delta.total_seconds() // 3600)
+        mins = int((delta.total_seconds() % 3600) // 60)
+        uptime = f"Uptime: {hours}h{mins:02d}m"
+
+    cache_items = len(_cache)
+    cache_info = f"Cache: {cache_items} itens"
+
+    # Testa RedTrack
+    rt_status = "OK"
+    try:
+        fetch_campaigns("24h")
+    except Exception as e:
+        rt_status = f"ERRO: {e}"
+
+    lines = [
+        f"STATUS DO BOT | {now.strftime('%d/%m/%Y %H:%M')}",
+        "",
+        f"Bot: online",
+        uptime,
+        cache_info,
+        f"RedTrack API: {rt_status}",
+        f"Gestores mapeados: {', '.join(sorted(set(GESTOR_MAP.values())))}",
+    ]
+    send_msg(chat_id, "\n".join(lines))
+
+
+def cmd_forecast(chat_id):
+    """Projeção do dia baseado no ritmo atual."""
+    campaigns = fetch_campaigns("24h", live=True)
+    now = datetime.now()
+    hora_atual = now.hour + now.minute / 60
+    if hora_atual < 8:
+        send_msg(chat_id, "Muito cedo para projeção. Volte após 10h.")
+        return
+
+    total_rev = sum(c["revenue"] for c in campaigns)
+    total_cost = sum(c["cost"] for c in campaigns)
+    total_vendas = sum(c["vendas"] for c in campaigns)
+
+    # Projeção linear baseada no horário (operação ~8h-23h = 15h úteis)
+    horas_uteis = max(hora_atual - 8, 1)
+    fator = 15 / horas_uteis
+
+    proj_rev = total_rev * fator
+    proj_cost = total_cost * fator
+    proj_vendas = int(total_vendas * fator)
+    roas_atual = calc_roas(total_rev, total_cost)
+    cpa_atual = calc_cpa(total_cost, total_vendas)
+
+    lines = [f"PROJECAO DO DIA | {now.strftime('%d/%m %H:%M')}\n"]
+    lines.append(f"Ate agora ({horas_uteis:.0f}h de operacao):")
+    lines.append(f"  Receita: {fmt(total_rev)} | Custo: {fmt(total_cost)} | ROAS: {roas_atual:.2f}")
+    lines.append(f"  Vendas: {total_vendas} | CPA: {fmt(cpa_atual)}\n")
+    lines.append(f"Projecao para o dia:")
+    lines.append(f"  Receita: ~{fmt(proj_rev)} | Custo: ~{fmt(proj_cost)}")
+    lines.append(f"  Vendas: ~{proj_vendas}")
+    lines.append(f"\nRitmo: {fmt(total_rev / horas_uteis)}/hora")
+
+    # Comparar com dia anterior
+    campaigns_ontem = fetch_campaigns("24h")
+    rev_ontem = sum(c["revenue"] for c in campaigns_ontem)
+    if rev_ontem > 0:
+        pct = ((proj_rev - rev_ontem) / rev_ontem) * 100
+        icon = "^" if pct > 0 else "v"
+        lines.append(f"vs Ontem: [{icon}] {pct:+.0f}% (ontem: {fmt(rev_ontem)})")
+
+    send_msg(chat_id, "\n".join(lines))
+
+
+def cmd_validacao(chat_id, period_key):
+    """Mostra criativos classificados por nível V5 (Super Cérebro de Tráfego)."""
+    send_msg(chat_id, "Classificando criativos (Super Cerebro V5)...")
+    from impera_cache import cached_cu_tasks, cached_rt_ads
+
+    date_from, date_to = get_dates(period_key)
+    tasks = cached_cu_tasks("901324476398", include_closed=False, ttl=600)
+    rt_data = cached_rt_ads(date_from, date_to, ttl=600)
+
+    # Build RT index
+    rt_index = defaultdict(lambda: {"vendas": 0, "custo": 0, "receita": 0})
+    for ad in rt_data["ads"]:
+        ad_name = (ad.get("rt_ad", "") or "").strip()
+        ad_cost = float(ad.get("cost", 0))
+        if ad_cost < 1 or not ad_name:
+            continue
+        norm = re.sub(r"\s+", "", ad_name.upper())
+        if re.match(r"^\d", norm):
+            norm = "AD" + norm
+        base = re.match(r"((?:AD|C[EYC]|IMG|C)\d+)", norm)
+        base_ref = base.group(1) if base else norm
+        ad_rev = float(ad.get("revenuetype2", 0)) + float(ad.get("revenuetype3", 0))
+        rt_index[base_ref]["vendas"] += int(ad.get("convtype1", 0))
+        rt_index[base_ref]["custo"] += ad_cost
+        rt_index[base_ref]["receita"] += ad_rev
+
+    # Classify tasks
+    nivels = {"top": [], "validado": [], "pre_v": [], "em_teste": []}
+    active_statuses = {"em teste", "pré-escala", "escala", "aguardando teste"}
+
+    for t in tasks:
+        if t.get("parent"):
+            continue
+        status = t["status"]["status"].lower()
+        if status not in active_statuses:
+            continue
+        name = t["name"]
+        upper = name.upper()
+        refs = set()
+        for m in re.findall(r"AD(\d+)", upper):
+            refs.add(f"AD{m}")
+        for m in re.findall(r"(C[EYC])(\d+)", upper):
+            refs.add(f"{m[0]}{m[1]}")
+        for m in re.findall(r"(?<![A-Z])C(\d+)", re.sub(r"\s+", "", upper)):
+            refs.add(f"C{m}")
+        if not refs:
+            continue
+
+        total_v = sum(rt_index[r]["vendas"] for r in refs if r in rt_index)
+        total_c = sum(rt_index[r]["custo"] for r in refs if r in rt_index)
+        total_r = sum(rt_index[r]["receita"] for r in refs if r in rt_index)
+        if total_c == 0:
+            continue
+
+        cpa = calc_cpa(total_c, total_v)
+        roas = calc_roas(total_r, total_c)
+        item = {"name": name[:45], "vendas": total_v, "cpa": cpa, "roas": roas, "custo": total_c}
+
+        if total_v >= 30 and roas >= CONFIG["ROAS_FRONT_MIN"]:
+            nivels["top"].append(item)
+        elif total_v >= 10 and cpa <= CONFIG["CPA_META"] and roas >= CONFIG["ROAS_FRONT_MIN"]:
+            nivels["validado"].append(item)
+        elif total_v >= 3 and cpa <= CONFIG["CPA_META"] and roas >= CONFIG["ROAS_FRONT_MIN"]:
+            nivels["pre_v"].append(item)
+        else:
+            nivels["em_teste"].append(item)
+
+    label = get_period_label(period_key)
+    lines = [f"VALIDACAO DE CRIATIVOS | {label}\n"]
+    lines.append(f"Regras: Super Cerebro V5 | ROAS Front >= {CONFIG['ROAS_FRONT_MIN']}\n")
+
+    for nivel, emoji, label_n in [("top", "+", "TOP/ESCALA"), ("validado", "~", "VALIDADO"), ("pre_v", "-", "PRE-VALIDADO"), ("em_teste", ".", "EM TESTE")]:
+        items = sorted(nivels[nivel], key=lambda x: x["vendas"], reverse=True)
+        lines.append(f"[{emoji}] {label_n}: {len(items)} criativos")
+        for it in items[:5]:
+            cpa_str = f"R${it['cpa']:.0f}" if it["vendas"] > 0 else "N/A"
+            lines.append(f"  {it['name']} | {it['vendas']}v | CPA {cpa_str} | ROAS {it['roas']:.2f}")
+        if len(items) > 5:
+            lines.append(f"  +{len(items)-5} omitidos")
+        lines.append("")
+
+    send_msg(chat_id, "\n".join(lines))
+
+
+def cmd_nichos(chat_id):
+    """Lista todos os nichos e ofertas disponíveis."""
+    campaigns = fetch_campaigns("7d")
+    nichos = defaultdict(lambda: {"ofertas": set(), "gestores": set(), "fontes": set(), "cost": 0, "revenue": 0})
+    for c in campaigns:
+        n = c.get("nicho")
+        if not n:
+            continue
+        nichos[n]["cost"] += c["cost"]
+        nichos[n]["revenue"] += c["revenue"]
+        if c.get("oferta"):
+            nichos[n]["ofertas"].add(c["oferta"])
+        if c.get("gestor"):
+            nichos[n]["gestores"].add(c["gestor"])
+        if c.get("fonte"):
+            nichos[n]["fontes"].add(c["fonte"])
+
+    lines = ["NICHOS E OFERTAS DISPONIVEIS (7d)\n"]
+    for n, d in sorted(nichos.items(), key=lambda x: x[1]["revenue"], reverse=True):
+        roas = calc_roas(d["revenue"], d["cost"])
+        lines.append(f"[{n}] {fmt(d['revenue'])} | ROAS {roas:.2f}")
+        lines.append(f"  Ofertas: {', '.join(sorted(d['ofertas']))}")
+        lines.append(f"  Gestores: {', '.join(sorted(d['gestores']))}")
+        lines.append(f"  Fontes: {', '.join(sorted(d['fontes']))}")
+        lines.append("")
+
+    lines.append("Use /oferta [SIGLA] para detalhes (ex: /oferta EM)")
+    send_msg(chat_id, "\n".join(lines))
+
+
+# ============================================================
+# AUTO REPORTS
+# ============================================================
+
+def auto_report_morning(chat_id):
+    """Journal da manha - 08:30."""
+    campaigns_yesterday = fetch_campaigns("24h")
+    campaigns_week = fetch_campaigns("7d")
+
+    total_rev_yesterday = sum(c["revenue"] for c in campaigns_yesterday)
+    total_cost_yesterday = sum(c["cost"] for c in campaigns_yesterday)
+    roas_yesterday = total_rev_yesterday / total_cost_yesterday if total_cost_yesterday > 0 else 0
+    vendas_yesterday = sum(c["vendas"] for c in campaigns_yesterday)
+
+    total_rev_week = sum(c["revenue"] for c in campaigns_week)
+    total_cost_week = sum(c["cost"] for c in campaigns_week)
+    roas_week = total_rev_week / total_cost_week if total_cost_week > 0 else 0
+
+    yesterday = (datetime.now() - timedelta(days=1)).strftime("%d/%m")
+    lines = [f"BOM DIA | Journal {datetime.now().strftime('%d/%m/%Y')}\n"]
+    lines.append(f"{yesterday} (dia anterior):")
+    lines.append(f"  Receita: {fmt(total_rev_yesterday)} | Custo: {fmt(total_cost_yesterday)} | ROAS: {roas_yesterday:.2f}")
+    lines.append(f"  Vendas CC: {vendas_yesterday}\n")
+    lines.append(f"Ultimos 7 dias:")
+    lines.append(f"  Receita: {fmt(total_rev_week)} | Custo: {fmt(total_cost_week)} | ROAS: {roas_week:.2f}\n")
+
+    # Top ofertas da semana
+    ofertas = defaultdict(lambda: {"cost": 0, "revenue": 0})
+    for c in campaigns_week:
+        if c["nicho"] and c["oferta"]:
+            key = build_oferta_key(c)
+            ofertas[key]["cost"] += c["cost"]
+            ofertas[key]["revenue"] += c["revenue"]
+
+    lines.append("Ofertas (7d):")
+    for key, d in sorted(ofertas.items(), key=lambda x: x[1]["revenue"], reverse=True):
+        if d["cost"] < CONFIG["MIN_COST_ALERT"]:
+            continue
+        roas = d["revenue"] / d["cost"] if d["cost"] > 0 else 0
+        icon = roas_icon(roas)
+        lines.append(f"  [{icon}] {key}: {fmt(d['revenue'])} | ROAS {roas:.2f}")
+
+    # Destaques inteligentes
+    lines.append("\nDestaques:")
+    # Oferta com melhor faturamento
+    if ofertas:
+        top = max(ofertas.items(), key=lambda x: x[1]["revenue"])
+        lines.append(f"  Maior faturamento: {top[0]} com {fmt(top[1]['revenue'])}")
+    # ROAS < 1.5 alerta
+    for key, d in ofertas.items():
+        roas = d["revenue"] / d["cost"] if d["cost"] > 0 else 0
+        if roas < CONFIG["ROAS_WARNING"] and d["cost"] > CONFIG["MIN_COST_HOURLY"]:
+            lines.append(f"  Atencao: {key} com ROAS {roas:.2f}")
+
+    send_msg(chat_id, "\n".join(lines))
+
+
+def auto_report_afternoon(chat_id):
+    """Report de atencao - 16:00."""
+    campaigns = fetch_campaigns("24h", live=True)
+
+    lines = [f"REPORT DE ATENCAO | {datetime.now().strftime('%d/%m %H:%M')}\n"]
+
+    # Alertas urgentes
+    alerts = []
+    ofertas = defaultdict(lambda: {"cost": 0, "revenue": 0, "vendas": 0})
+    for c in campaigns:
+        if c["nicho"] and c["oferta"]:
+            key = build_oferta_key(c)
+            ofertas[key]["cost"] += c["cost"]
+            ofertas[key]["revenue"] += c["revenue"]
+            ofertas[key]["vendas"] += c["vendas"]
+        if c["cost"] >= CONFIG["MIN_COST_CRITICAL"] and c["vendas"] == 0:
+            alerts.append(f"  [!!] Gasto sem venda: {c['name'][:40]} | {fmt(c['cost'])} | Gestor: {c.get('gestor','?')}")
+
+    # ROAS < 1.5
+    for key, d in ofertas.items():
+        roas = d["revenue"] / d["cost"] if d["cost"] > 0 else 0
+        if roas < CONFIG["ROAS_WARNING"] and d["cost"] > CONFIG["MIN_COST_CRITICAL"]:
+            alerts.append(f"  [!!] ROAS baixo: {key} | {roas:.2f} | Custo: {fmt(d['cost'])}")
+
+    if alerts:
+        lines.append("URGENTES:")
+        lines.extend(alerts)
+        lines.append("")
+    else:
+        lines.append("Nenhum alerta urgente.\n")
+
+    # Performance do dia
+    total_rev = sum(d["revenue"] for d in ofertas.values())
+    total_cost = sum(d["cost"] for d in ofertas.values())
+    roas = total_rev / total_cost if total_cost > 0 else 0
+    lines.append(f"Hoje ate agora:")
+    lines.append(f"  Receita: {fmt(total_rev)} | Custo: {fmt(total_cost)} | ROAS: {roas:.2f}")
+
+    # Gestores
+    gestores = defaultdict(lambda: {"cost": 0, "revenue": 0, "vendas": 0})
+    for c in campaigns:
+        g = c.get("gestor") or "N/A"
+        gestores[g]["cost"] += c["cost"]
+        gestores[g]["revenue"] += c["revenue"]
+        gestores[g]["vendas"] += c["vendas"]
+
+    lines.append("\nGestores hoje:")
+    for g, d in sorted(gestores.items(), key=lambda x: x[1]["revenue"], reverse=True):
+        if d["cost"] < CONFIG["MIN_COST_DISPLAY"]:
+            continue
+        roas = d["revenue"] / d["cost"] if d["cost"] > 0 else 0
+        icon = roas_icon(roas)
+        lines.append(f"  [{icon}] {g}: {fmt(d['revenue'])} | ROAS {roas:.2f}")
+
+    send_msg(chat_id, "\n".join(lines))
+
+
+def hourly_check(chat_id):
+    """Checagem horaria silenciosa - so manda se encontrar algo critico."""
+    campaigns = fetch_campaigns("24h", use_cache=False, live=True)
+
+    alerts = []
+
+    # ROAS < 1.0 em oferta com gasto relevante
+    ofertas = defaultdict(lambda: {"cost": 0, "revenue": 0})
+    for c in campaigns:
+        if c["nicho"] and c["oferta"]:
+            key = build_oferta_key(c)
+            ofertas[key]["cost"] += c["cost"]
+            ofertas[key]["revenue"] += c["revenue"]
+
+    for key, d in ofertas.items():
+        roas = d["revenue"] / d["cost"] if d["cost"] > 0 else 0
+        if roas < CONFIG["ROAS_CRITICAL"] and d["cost"] > CONFIG["MIN_COST_HOURLY"]:
+            alerts.append(f"[!!] {key}: ROAS {roas:.2f} com {fmt(d['cost'])} gastos")
+
+    # Campanha com gasto > R$1000 sem venda
+    for c in campaigns:
+        if c["cost"] >= CONFIG["MIN_COST_HOURLY"] and c["vendas"] == 0:
+            g = c.get("gestor") or "?"
+            alerts.append(f"[!!] {c['name'][:40]}: {fmt(c['cost'])} gasto, 0 vendas | {g}")
+
+    if alerts:
+        msg = f"ALERTA AUTOMATICO | {datetime.now().strftime('%H:%M')}\n\n" + "\n".join(alerts)
+        send_msg(chat_id, msg)
+        print(f"[{datetime.now().isoformat()}] {len(alerts)} alertas enviados.")
+    else:
+        print(f"[{datetime.now().isoformat()}] Check OK, sem alertas.")
+
+
+# ============================================================
+# REPORT SAVE (for /doc)
+# ============================================================
+
+def save_last_report(cmd, content):
+    os.makedirs(os.path.dirname(LAST_REPORT_FILE), exist_ok=True)
+    data = {"command": cmd, "content": content, "timestamp": datetime.now().isoformat()}
+    with open(LAST_REPORT_FILE, "w") as f:
+        json.dump(data, f, ensure_ascii=False)
+
+
+def cmd_doc(chat_id):
+    """Gera PDF do ultimo relatorio e envia."""
+    if not os.path.exists(LAST_REPORT_FILE):
+        send_msg(chat_id, "Nenhum relatorio consultado ainda. Use um comando primeiro.")
+        return
+
+    with open(LAST_REPORT_FILE) as f:
+        data = json.load(f)
+
+    content = data["content"]
+    cmd = data["command"]
+    ts = data["timestamp"][:16]
+
+    # Gera PDF
+    try:
+        from fpdf import FPDF
+        pdf = FPDF()
+        pdf.add_page()
+        pdf.set_auto_page_break(auto=True, margin=15)
+        pdf.set_font("Helvetica", "B", 14)
+        pdf.cell(0, 10, f"IMPERA Performance - {cmd.upper()}", new_x="LMARGIN", new_y="NEXT")
+        pdf.set_font("Helvetica", "", 9)
+        pdf.set_text_color(150, 150, 150)
+        pdf.cell(0, 6, f"Gerado em {ts}", new_x="LMARGIN", new_y="NEXT")
+        pdf.ln(5)
+        pdf.set_font("Courier", "", 8)
+        pdf.set_text_color(50, 50, 50)
+        for line in content.split("\n"):
+            pdf.cell(0, 4, line[:120], new_x="LMARGIN", new_y="NEXT")
+        # Assinatura
+        pdf.ln(10)
+        pdf.set_font("Helvetica", "I", 8)
+        pdf.set_text_color(150, 150, 150)
+        pdf.cell(0, 5, "GPDR - Iago Almeida | IMPERA Produtos Naturais", align="C", new_x="LMARGIN", new_y="NEXT")
+        pdf.cell(0, 5, "Assistido por Claude - Anthropic", align="C")
+
+        filepath = os.path.expanduser(f"~/Documents/Performance_{cmd}_{datetime.now().strftime('%d%m%Y_%H%M')}.pdf")
+        pdf.output(filepath)
+
+        # Envia arquivo via Telegram
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendDocument"
+        import subprocess
+        subprocess.run([
+            "curl", "-s", "-X", "POST", url,
+            "-F", f"chat_id={chat_id}",
+            "-F", f"document=@{filepath}",
+            "-F", f"caption=Performance {cmd.upper()} - {ts}",
+        ], capture_output=True)
+
+        send_msg(chat_id, f"Documento gerado e enviado.")
+    except Exception as e:
+        send_msg(chat_id, f"Erro ao gerar documento: {e}")
+
+
+# ============================================================
+# /GERAR — PROMPT GEMINI DOCS OU DOCUMENTO DIRETO
+# ============================================================
+
+GERAR_TYPES = {
+    "producao": "Semanal Producao",
+    "performance": "Performance Semanal",
+    "consolidado": "GPDR Consolidado",
+    "mensal": "Mensal",
+}
+
+
+def build_raw_report_data(report_type, period_key):
+    """Monta dados brutos para o prompt."""
+    campaigns = fetch_campaigns(period_key)
+    period_label = get_period_label(period_key)
+
+    total_rev = sum(c["revenue"] for c in campaigns)
+    total_cost = sum(c["cost"] for c in campaigns)
+    total_roas = total_rev / total_cost if total_cost > 0 else 0
+    total_vendas = sum(c["vendas"] for c in campaigns)
+
+    lines = [f"RELATORIO: {GERAR_TYPES[report_type]}", f"PERIODO: {period_label}",
+             f"RECEITA TOTAL: {fmt(total_rev)}", f"CUSTO TOTAL: {fmt(total_cost)}",
+             f"ROAS GERAL: {total_roas:.2f}", f"VENDAS CC: {total_vendas}", ""]
+
+    # Ofertas
+    ofertas = defaultdict(lambda: {"cost": 0, "revenue": 0, "vendas": 0})
+    for c in campaigns:
+        if c.get("nicho") and c.get("oferta"):
+            k = build_oferta_key(c)
+            ofertas[k]["cost"] += c["cost"]
+            ofertas[k]["revenue"] += c["revenue"]
+            ofertas[k]["vendas"] += c["vendas"]
+
+    lines.append("OFERTAS:")
+    for k, d in sorted(ofertas.items(), key=lambda x: x[1]["revenue"], reverse=True):
+        if d["cost"] < CONFIG["MIN_COST_ALERT"]:
+            continue
+        roas = d["revenue"] / d["cost"] if d["cost"] else 0
+        cpa = d["cost"] / d["vendas"] if d["vendas"] else 0
+        lines.append(f"  {k}: Receita {fmt(d['revenue'])} | Custo {fmt(d['cost'])} | ROAS {roas:.2f} | Vendas {d['vendas']} | CPA {fmt(cpa)}")
+
+    # Gestores
+    gestores = defaultdict(lambda: {"cost": 0, "revenue": 0, "vendas": 0, "camps": 0, "nichos": set()})
+    for c in campaigns:
+        g = c.get("gestor") or "N/A"
+        gestores[g]["cost"] += c["cost"]
+        gestores[g]["revenue"] += c["revenue"]
+        gestores[g]["vendas"] += c["vendas"]
+        gestores[g]["camps"] += 1
+        if c.get("nicho"):
+            gestores[g]["nichos"].add(c["nicho"])
+
+    lines.append("\nGESTORES:")
+    for g, d in sorted(gestores.items(), key=lambda x: x[1]["revenue"], reverse=True):
+        if d["cost"] < CONFIG["MIN_COST_ALERT"]:
+            continue
+        roas = d["revenue"] / d["cost"] if d["cost"] else 0
+        lines.append(f"  {g}: Receita {fmt(d['revenue'])} | Custo {fmt(d['cost'])} | ROAS {roas:.2f} | Vendas {d['vendas']} | {d['camps']} camps")
+
+    # Alertas
+    lines.append("\nALERTAS:")
+    for k, d in ofertas.items():
+        roas = d["revenue"] / d["cost"] if d["cost"] else 0
+        if roas < CONFIG["ROAS_WARNING"] and d["cost"] > CONFIG["MIN_COST_CRITICAL"]:
+            lines.append(f"  ROAS baixo: {k} com {roas:.2f}")
+    for c in campaigns:
+        if c["cost"] >= CONFIG["MIN_COST_HOURLY"] and c["vendas"] == 0:
+            lines.append(f"  Gasto sem venda: {c['name'][:35]} | {fmt(c['cost'])}")
+
+    return "\n".join(lines)
+
+
+def build_gemini_docs_prompt(raw_data, report_type):
+    """Monta prompt otimizado para colar no 'Me ajude a criar' do Google Docs."""
+    label = GERAR_TYPES[report_type]
+    return (
+        f"Crie um relatorio executivo profissional chamado '{label}' para a empresa IMPERA Produtos Naturais, "
+        f"uma empresa de direct-response de nutraceuticos. "
+        f"Use layout profissional com tabelas, secoes claras e cores. "
+        f"O ranking principal e por FATURAMENTO (receita), nao por ROAS. "
+        f"ROAS abaixo de 1.5 merece destaque de atencao. "
+        f"Limite de 5000 caracteres. "
+        f"Assine como: GPDR - Iago Almeida | IMPERA Produtos Naturais.\n\n"
+        f"DADOS:\n{raw_data}"
+    )
+
+
+def cmd_gerar_select_type(chat_id, period_key):
+    """Mostra seletor de tipo de relatorio."""
+    keyboard = {
+        "inline_keyboard": [
+            [
+                {"text": "Producao", "callback_data": f"gerar_type|producao|{period_key}"},
+                {"text": "Performance", "callback_data": f"gerar_type|performance|{period_key}"},
+            ],
+            [
+                {"text": "GPDR Consolidado", "callback_data": f"gerar_type|consolidado|{period_key}"},
+                {"text": "Mensal", "callback_data": f"gerar_type|mensal|{period_key}"},
+            ],
+        ]
+    }
+    send_msg(chat_id, "Qual relatorio deseja gerar?", reply_markup=keyboard)
+
+
+def cmd_gerar_select_output(chat_id, report_type, period_key):
+    """Mostra seletor: prompt para Docs ou documento direto."""
+    keyboard = {
+        "inline_keyboard": [
+            [{"text": "Prompt para Google Docs", "callback_data": f"gerar_prompt|{report_type}|{period_key}"}],
+            [{"text": "Documento direto (Google Docs)", "callback_data": f"gerar_doc|{report_type}|{period_key}"}],
+        ]
+    }
+    label = GERAR_TYPES[report_type]
+    send_msg(chat_id, f"Relatorio: {label}\nComo deseja receber?", reply_markup=keyboard)
+
+
+def cmd_gerar_prompt(chat_id, report_type, period_key):
+    """Envia o prompt pronto para colar no Gemini do Google Docs."""
+    send_msg(chat_id, "Buscando dados e montando prompt...")
+    raw_data = build_raw_report_data(report_type, period_key)
+    prompt = build_gemini_docs_prompt(raw_data, report_type)
+    send_msg(chat_id, f"Copie o prompt abaixo e cole no 'Me ajude a criar' do Google Docs:\n\n{prompt}")
+
+
+def cmd_gerar_doc(chat_id, report_type, period_key):
+    """Gera documento direto no Google Docs via Gemini API."""
+    send_msg(chat_id, "Gerando documento no Google Docs...")
+    try:
+        import subprocess
+        result = subprocess.run(
+            [sys.executable, os.path.expanduser("~/Scripts/relatorios_gdocs.py"), report_type],
+            capture_output=True, text=True, timeout=180,
+            env={**os.environ, "GEMINI_API_KEY": os.environ.get("GEMINI_API_KEY", ""),
+                 "CLICKUP_API_TOKEN": os.environ.get("CLICKUP_API_TOKEN", ""),
+                 "REDTRACK_API_KEY": os.environ.get("REDTRACK_API_KEY", "")},
+        )
+        output = result.stdout + result.stderr
+        # Extrai URL do doc
+        url_match = re.search(r"https://docs\.google\.com/document/d/[^\s]+", output)
+        if url_match:
+            send_msg(chat_id, f"Documento criado:\n{url_match.group()}")
+        else:
+            send_msg(chat_id, f"Documento gerado mas nao consegui extrair o link.\n{output[-200:]}")
+    except Exception as e:
+        send_msg(chat_id, f"Erro ao gerar documento: {e}")
+
+
+# ============================================================
+# BOT POLLING
+# ============================================================
+
+def load_offset():
+    if os.path.exists(OFFSET_FILE):
+        with open(OFFSET_FILE) as f:
+            return int(f.read().strip())
+    return 0
+
+
+def save_offset(offset):
+    os.makedirs(os.path.dirname(OFFSET_FILE), exist_ok=True)
+    with open(OFFSET_FILE, "w") as f:
+        f.write(str(offset))
+
+
+COMMAND_HANDLERS = {
+    "performance": cmd_performance,
+    "campanhas": cmd_campanhas,
+    "gestores": cmd_gestores,
+    "copywriters": cmd_copywriters,
+    "criativos": cmd_criativos,
+    "fonte": cmd_fonte,
+    "comparativo": cmd_comparativo,
+    "validacao": cmd_validacao,
+}
+
+
+def parse_custom_dates(text):
+    """Tenta parsear datas no formato DD/MM-DD/MM ou DD/MM/YYYY-DD/MM/YYYY.
+    Retorna period_key no formato YYYYMMDD_YYYYMMDD ou None."""
+    text = text.strip().replace(" ", "")
+    # Aceita separadores: - ou " a " ou " A "
+    for sep in ["-", "a", "A"]:
+        if sep in text:
+            parts = text.split(sep, 1)
+            if len(parts) == 2:
+                try:
+                    year = datetime.now().year
+                    d1_str, d2_str = parts[0].strip(), parts[1].strip()
+                    if len(d1_str) > 5:  # DD/MM/YYYY
+                        d1 = datetime.strptime(d1_str, "%d/%m/%Y")
+                    else:  # DD/MM
+                        d1 = datetime.strptime(f"{d1_str}/{year}", "%d/%m/%Y")
+                    if len(d2_str) > 5:
+                        d2 = datetime.strptime(d2_str, "%d/%m/%Y")
+                    else:
+                        d2 = datetime.strptime(f"{d2_str}/{year}", "%d/%m/%Y")
+                    if d2 >= d1:
+                        return f"{d1.strftime('%Y%m%d')}_{d2.strftime('%Y%m%d')}"
+                except ValueError:
+                    continue
+    return None
+
+
+def handle_message(chat_id, text):
+    # Verifica se ha periodo customizado pendente (usuario digitando datas)
+    if chat_id in _pending_custom_period:
+        pending = _pending_custom_period.pop(chat_id)
+        period_key = parse_custom_dates(text.strip())
+        if period_key:
+            cmd = pending["command"]
+            extra = pending.get("extra", "")
+            if cmd in COMMAND_HANDLERS:
+                safe_command(chat_id, COMMAND_HANDLERS[cmd], period_key)
+            elif cmd == "oferta" and extra:
+                safe_command(chat_id, cmd_oferta, period_key, extra)
+            elif cmd == "gestor" and extra:
+                safe_command(chat_id, cmd_gestor, period_key, extra)
+            elif cmd == "gerar":
+                cmd_gerar_select_type(chat_id, period_key)
+            else:
+                safe_command(chat_id, cmd_performance, period_key)
+            return
+        else:
+            send_msg(chat_id,
+                "Formato invalido. Use DD/MM-DD/MM (ex: 01/04-15/04).\n"
+                "Tente novamente ou use outro comando."
+            )
+            return
+
+    text = text.strip().lower().lstrip("/")
+    parts = text.split()
+    cmd = parts[0] if parts else ""
+    extra = " ".join(parts[1:])
+
+    # Suporte a datas inline: /performance 01/04-15/04
+    if cmd in COMMANDS_WITH_PERIOD and extra:
+        period_key = parse_custom_dates(extra)
+        if period_key:
+            cmd_extra = ""
+            if cmd == "oferta":
+                cmd_extra = extra.split()[-1] if len(extra.split()) > 1 else ""
+                safe_command(chat_id, cmd_oferta, period_key, cmd_extra) if cmd_extra else safe_command(chat_id, cmd_performance, period_key)
+            elif cmd == "gestor":
+                cmd_extra = extra.split()[-1] if len(extra.split()) > 1 else ""
+                safe_command(chat_id, cmd_gestor, period_key, cmd_extra) if cmd_extra else safe_command(chat_id, cmd_gestores, period_key)
+            elif cmd in COMMAND_HANDLERS:
+                safe_command(chat_id, COMMAND_HANDLERS[cmd], period_key)
+            return
+
+    if cmd == "help" or cmd == "start":
+        send_msg(chat_id,
+            "IMPERA Performance - Comandos:\n\n"
+            "/performance - Visao geral por oferta\n"
+            "/campanhas - Performance por campanha\n"
+            "/gestores - Ranking gestores de trafego\n"
+            "/copywriters - Ranking copywriters\n"
+            "/criativos - Top criativos com copy/editor\n"
+            "/oferta [sigla] - Detalhe de oferta (ex: /oferta EM)\n"
+            "/gestor [nome] - Detalhe de gestor (ex: /gestor lucas)\n"
+            "/fonte - Performance por fonte de trafego\n"
+            "/comparativo - Comparar periodo atual vs anterior\n"
+            "/resumo - Resumo rapido do dia (24h)\n"
+            "/alertas - Alertas ativos\n"
+            "/forecast - Projecao do dia baseado no ritmo atual\n"
+            "/validacao - Criativos por nivel (Super Cerebro V5)\n"
+            "/nichos - Nichos e ofertas disponiveis\n"
+            "/gerar - Gerar relatorio (prompt Docs ou documento)\n"
+            "/doc - Gera PDF do ultimo relatorio\n"
+            "/status - Status do bot\n"
+            "/help - Esta mensagem"
+        )
+    elif cmd == "alertas":
+        safe_command(chat_id, cmd_alertas)
+    elif cmd == "resumo":
+        safe_command(chat_id, cmd_resumo)
+    elif cmd == "status":
+        safe_command(chat_id, cmd_status)
+    elif cmd == "doc":
+        safe_command(chat_id, cmd_doc)
+    elif cmd == "forecast":
+        safe_command(chat_id, cmd_forecast)
+    elif cmd == "nichos":
+        safe_command(chat_id, cmd_nichos)
+    elif cmd == "gerar":
+        send_period_selector(chat_id, "gerar", "")
+    elif cmd in COMMANDS_WITH_PERIOD:
+        send_period_selector(chat_id, cmd, extra)
+    else:
+        return  # Ignora comandos desconhecidos
+
+
+def handle_callback(callback_id, chat_id, data):
+    """Processa callback de inline button (seletor de periodo)."""
+    parts = data.split("|")
+    cmd = parts[0]
+    period = parts[1] if len(parts) > 1 else "7d"
+    extra = parts[2] if len(parts) > 2 else ""
+
+    answer_callback(callback_id)
+
+    # Personalizar — mostra presets inteligentes
+    if cmd == "custom_period":
+        # period aqui e o comando original, extra e o extra original
+        send_custom_period_selector(chat_id, period, extra)
+        return
+
+    # Digitar datas — salva estado e pede input
+    if cmd == "custom_type":
+        _pending_custom_period[chat_id] = {"command": period, "extra": extra}
+        send_msg(chat_id,
+            "Digite o periodo no formato DD/MM-DD/MM\n"
+            "Exemplo: 01/04-15/04\n\n"
+            "Ou com ano: 01/04/2026-15/04/2026"
+        )
+        return
+
+    if cmd in COMMAND_HANDLERS:
+        safe_command(chat_id, COMMAND_HANDLERS[cmd], period)
+    elif cmd == "oferta":
+        if extra:
+            safe_command(chat_id, cmd_oferta, period, extra)
+        else:
+            safe_command(chat_id, cmd_performance, period)
+    elif cmd == "gestor":
+        if extra:
+            safe_command(chat_id, cmd_gestor, period, extra)
+        else:
+            safe_command(chat_id, cmd_gestores, period)
+    elif cmd == "gerar":
+        cmd_gerar_select_type(chat_id, period)
+    elif cmd == "gerar_type":
+        # period aqui e o report_type, extra e o period_key
+        cmd_gerar_select_output(chat_id, period, extra)
+    elif cmd == "gerar_prompt":
+        cmd_gerar_prompt(chat_id, period, extra)
+    elif cmd == "gerar_doc":
+        cmd_gerar_doc(chat_id, period, extra)
+
+
+def bot_poll_once():
+    offset = load_offset()
+    try:
+        result = tg_request("getUpdates", {"offset": offset + 1, "timeout": 30})
+    except Exception as e:
+        print(f"[{datetime.now().isoformat()}] Poll error: {e}")
+        return
+
+    for update in result.get("result", []):
+        uid = update["update_id"]
+
+        # Message
+        msg = update.get("message", {})
+        if msg:
+            chat_id = msg.get("chat", {}).get("id")
+            text = msg.get("text", "")
+            if chat_id and text:
+                handle_message(chat_id, text)
+
+        # Callback query (inline button click)
+        cb = update.get("callback_query", {})
+        if cb:
+            cb_id = cb.get("id")
+            chat_id = cb.get("message", {}).get("chat", {}).get("id")
+            data = cb.get("data", "")
+            if chat_id and data:
+                handle_callback(cb_id, chat_id, data)
+
+        save_offset(uid)
+
+
+def cmd_bot():
+    global BOT_START_TIME
+    if not TELEGRAM_TOKEN:
+        print("TELEGRAM_PERF_TOKEN nao configurado.")
+        sys.exit(1)
+
+    BOT_START_TIME = datetime.now()
+    print(f"[{BOT_START_TIME.isoformat()}] Bot IMPERA Performance iniciado.")
+
+    # Registra comandos
+    cmds = [
+        {"command": "performance", "description": "Visao geral por oferta"},
+        {"command": "campanhas", "description": "Performance por campanha"},
+        {"command": "gestores", "description": "Ranking gestores de trafego"},
+        {"command": "copywriters", "description": "Ranking copywriters"},
+        {"command": "criativos", "description": "Top criativos com copy/editor"},
+        {"command": "fonte", "description": "Performance por fonte de trafego"},
+        {"command": "comparativo", "description": "Comparar periodo atual vs anterior"},
+        {"command": "resumo", "description": "Resumo rapido do dia (24h)"},
+        {"command": "alertas", "description": "Alertas ativos"},
+        {"command": "forecast", "description": "Projecao do dia baseado no ritmo atual"},
+        {"command": "validacao", "description": "Criativos por nivel (Super Cerebro V5)"},
+        {"command": "nichos", "description": "Nichos e ofertas disponiveis"},
+        {"command": "gerar", "description": "Gerar relatorio (prompt Docs ou documento)"},
+        {"command": "doc", "description": "Gera PDF do ultimo relatorio"},
+        {"command": "status", "description": "Status do bot"},
+        {"command": "help", "description": "Lista de comandos"},
+    ]
+    tg_request("setMyCommands", {"commands": cmds})
+    print("Comandos registrados.")
+
+    while True:
+        try:
+            bot_poll_once()
+        except KeyboardInterrupt:
+            print("\nBot encerrado.")
+            break
+        except Exception as e:
+            print(f"[{datetime.now().isoformat()}] Erro: {e}")
+            _time.sleep(5)
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+if __name__ == "__main__":
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "bot"
+
+    if cmd == "bot":
+        cmd_bot()
+    elif cmd == "morning":
+        auto_report_morning(TELEGRAM_CHAT_ID)
+    elif cmd == "afternoon":
+        auto_report_afternoon(TELEGRAM_CHAT_ID)
+    elif cmd == "check":
+        hourly_check(TELEGRAM_CHAT_ID)
+    else:
+        print(__doc__)

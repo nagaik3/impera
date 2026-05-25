@@ -1,0 +1,1264 @@
+#!/usr/bin/env python3
+"""
+Bot GPDR IMPERA — Telegram
+Gestao de tarefas, nomenclatura e relatorios via Telegram.
+
+Comandos:
+  /criar       — Criar tarefas no ClickUp (conversacional)
+  /corrigir    — Corrigir nomenclatura de tarefas
+  /auditoria   — Rodar auditoria de nomenclatura agora
+  /producao    — Gerar relatorio de producao semanal
+  /relatorio   — Gerar relatorio (GPDR, mensal, etc.)
+  /relatorio_performance_criativos — Performance por criativo/copywriter
+  /briefing    — Briefing diario sob demanda
+  /status      — Status do bot
+  /help        — Lista de comandos
+
+Uso:
+  python3 bot_gpdr.py bot       # Bot interativo (long-polling)
+  python3 bot_gpdr.py autofix   # Correcao automatica (crontab)
+"""
+
+import os
+import sys
+import json
+import re
+import time as _time
+import urllib.request
+from datetime import datetime, timedelta
+from collections import defaultdict
+
+sys.path.insert(0, os.path.expanduser("~/Scripts"))
+from clickup_criar_tarefa import (
+    NICHOS, FONTES, COPYWRITERS, EDITORES, OFERTAS,
+    LIST_COPY, CF_COPYWRITER, CF_EDITOR, CF_FONTE, CF_OFERTA, CF_NICHO, CF_MES, MESES,
+    api_get, api_post, api_request,
+    get_last_ad_number, create_task_with_checklists,
+)
+from auditoria_nomenclatura import (
+    validate_task_name, extract_brackets, fetch_tasks,
+    NICHOS_VALIDOS, NICHOS_COM_MERCADO, FONTES_VALIDAS,
+)
+
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_GPDR_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+CLICKUP_TOKEN = os.environ.get("CLICKUP_API_TOKEN", "")
+
+OFFSET_FILE = os.path.expanduser("~/Scripts/data/gpdr_bot_offset.txt")
+
+BOT_START_TIME = None
+
+# ============================================================
+# CONVERSATION STATE — para fluxos multi-step
+# ============================================================
+
+_conversations = {}  # chat_id -> {"step": ..., "data": {...}}
+
+
+def get_conv(chat_id):
+    return _conversations.get(chat_id)
+
+
+def set_conv(chat_id, step, data=None):
+    if chat_id not in _conversations:
+        _conversations[chat_id] = {"step": step, "data": data or {}}
+    else:
+        _conversations[chat_id]["step"] = step
+        if data:
+            _conversations[chat_id]["data"].update(data)
+
+
+def clear_conv(chat_id):
+    _conversations.pop(chat_id, None)
+
+
+# ============================================================
+# TELEGRAM HELPERS
+# ============================================================
+
+def tg_request(method, data=None):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/{method}"
+    body = json.dumps(data).encode() if data else None
+    req = urllib.request.Request(url, data=body, method="POST")
+    req.add_header("Content-Type", "application/json")
+    with urllib.request.urlopen(req, timeout=35) as resp:
+        return json.loads(resp.read())
+
+
+def send_msg(chat_id, text, reply_markup=None):
+    chunks = []
+    if len(text) <= 4000:
+        chunks = [text]
+    else:
+        lines = text.split("\n")
+        current = ""
+        for line in lines:
+            if len(current) + len(line) + 1 > 4000:
+                chunks.append(current)
+                current = line
+            else:
+                current += ("\n" + line) if current else line
+        if current:
+            chunks.append(current)
+
+    for i, chunk in enumerate(chunks):
+        payload = {"chat_id": chat_id, "text": chunk, "disable_web_page_preview": True}
+        if reply_markup and i == len(chunks) - 1:
+            payload["reply_markup"] = reply_markup
+        try:
+            tg_request("sendMessage", payload)
+        except Exception as e:
+            print(f"[{datetime.now().isoformat()}] Erro envio: {e}")
+
+
+def answer_callback(callback_id):
+    try:
+        tg_request("answerCallbackQuery", {"callback_query_id": callback_id})
+    except Exception:
+        pass
+
+
+# ============================================================
+# /CRIAR — Criacao de tarefas conversacional
+# ============================================================
+
+TIPOS_TAREFA = {
+    "novos_video": "Criativos Novos (Video)",
+    "novos_img": "Criativos Novos (Imagem)",
+    "variacoes_video": "Variacoes (Video)",
+    "variacoes_img": "Variacoes (Imagem)",
+    "ripagem": "Ripagem",
+    "vsl": "VSL",
+    "otmz": "Otimizacao de VSL",
+    "lead": "Lead",
+    "microlead": "Microlead",
+}
+
+NICHOS_COM_MERCADO_SET = {"MM", "EM"}
+
+OFERTA_POR_NICHO = {}
+for sigla, info in NICHOS.items():
+    OFERTA_POR_NICHO[sigla] = info["oferta"]
+
+
+def cmd_criar_start(chat_id):
+    """Inicia o fluxo de criacao de tarefa."""
+    keyboard = {"inline_keyboard": [
+        [
+            {"text": "Video Novo", "callback_data": "criar|tipo|novos_video"},
+            {"text": "Imagem Nova", "callback_data": "criar|tipo|novos_img"},
+        ],
+        [
+            {"text": "Var. Video", "callback_data": "criar|tipo|variacoes_video"},
+            {"text": "Var. Imagem", "callback_data": "criar|tipo|variacoes_img"},
+        ],
+        [
+            {"text": "Ripagem", "callback_data": "criar|tipo|ripagem"},
+            {"text": "VSL", "callback_data": "criar|tipo|vsl"},
+        ],
+        [
+            {"text": "Otimizacao", "callback_data": "criar|tipo|otmz"},
+            {"text": "Lead", "callback_data": "criar|tipo|lead"},
+        ],
+        [
+            {"text": "Microlead", "callback_data": "criar|tipo|microlead"},
+        ],
+        [
+            {"text": "Cancelar", "callback_data": "criar|cancelar|"},
+        ],
+    ]}
+    send_msg(chat_id, "O que deseja criar?", reply_markup=keyboard)
+
+
+def criar_ask_nicho(chat_id):
+    """Pede o nicho."""
+    nichos = sorted(NICHOS.keys())
+    rows = []
+    row = []
+    for n in nichos:
+        row.append({"text": n, "callback_data": f"criar|nicho|{n}"})
+        if len(row) == 4:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([{"text": "Cancelar", "callback_data": "criar|cancelar|"}])
+    send_msg(chat_id, "Selecione o nicho:", reply_markup={"inline_keyboard": rows})
+
+
+def criar_ask_mercado(chat_id):
+    keyboard = {"inline_keyboard": [
+        [
+            {"text": "BR", "callback_data": "criar|mercado|BR"},
+            {"text": "EUA", "callback_data": "criar|mercado|EUA"},
+        ],
+        [{"text": "Cancelar", "callback_data": "criar|cancelar|"}],
+    ]}
+    send_msg(chat_id, "Selecione o mercado:", reply_markup=keyboard)
+
+
+def criar_ask_fonte(chat_id):
+    fontes = sorted(FONTES.keys())
+    rows = []
+    row = []
+    for f in fontes:
+        row.append({"text": f, "callback_data": f"criar|fonte|{f}"})
+        if len(row) == 4:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([{"text": "Cancelar", "callback_data": "criar|cancelar|"}])
+    send_msg(chat_id, "Selecione a fonte de trafego:", reply_markup={"inline_keyboard": rows})
+
+
+def criar_ask_qty(chat_id, tipo):
+    set_conv(chat_id, "criar_qty")
+    if tipo == "ripagem":
+        send_msg(chat_id, "Quantos criativos ripados?")
+    elif tipo in ("lead", "microlead"):
+        send_msg(chat_id, f"Quantos {'leads' if tipo == 'lead' else 'microleads'}?")
+    elif tipo.startswith("variacoes"):
+        send_msg(chat_id, "Quantas variacoes?")
+    else:
+        send_msg(chat_id, "Quantos criativos?")
+
+
+def criar_ask_hooks(chat_id):
+    keyboard = {"inline_keyboard": [
+        [
+            {"text": "1 hook (V1)", "callback_data": "criar|hooks|V1"},
+            {"text": "2 hooks (V1-V2)", "callback_data": "criar|hooks|V1-V2"},
+            {"text": "3 hooks (V1-V3)", "callback_data": "criar|hooks|V1-V3"},
+        ],
+        [{"text": "Cancelar", "callback_data": "criar|cancelar|"}],
+    ]}
+    send_msg(chat_id, "Quantos hooks por AD?", reply_markup=keyboard)
+
+
+def criar_ask_rip_prefix(chat_id):
+    keyboard = {"inline_keyboard": [
+        [
+            {"text": "CE (Elias)", "callback_data": "criar|rip|CE"},
+            {"text": "CY (Yan)", "callback_data": "criar|rip|CY"},
+        ],
+        [
+            {"text": "CC (Cassio)", "callback_data": "criar|rip|CC"},
+        ],
+        [{"text": "Cancelar", "callback_data": "criar|cancelar|"}],
+    ]}
+    send_msg(chat_id, "Prefixo de ripagem (quem ripou):", reply_markup=keyboard)
+
+
+def criar_ask_copywriter(chat_id):
+    cws = ["YAN", "CRISPIM", "CÁSSIO", "ANA", "ELIAS"]
+    rows = []
+    row = []
+    for cw in cws:
+        row.append({"text": cw, "callback_data": f"criar|copy|{cw}"})
+        if len(row) == 3:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([{"text": "Cancelar", "callback_data": "criar|cancelar|"}])
+    send_msg(chat_id, "Copywriter responsavel:", reply_markup={"inline_keyboard": rows})
+
+
+def criar_ask_batch(chat_id):
+    keyboard = {"inline_keyboard": [
+        [
+            {"text": "Tarefa unica", "callback_data": "criar|batch|0"},
+            {"text": "5 por tarefa", "callback_data": "criar|batch|5"},
+        ],
+        [
+            {"text": "10 por tarefa", "callback_data": "criar|batch|10"},
+            {"text": "15 por tarefa", "callback_data": "criar|batch|15"},
+        ],
+        [
+            {"text": "20 por tarefa", "callback_data": "criar|batch|20"},
+            {"text": "50 por tarefa", "callback_data": "criar|batch|50"},
+        ],
+        [{"text": "Cancelar", "callback_data": "criar|cancelar|"}],
+    ]}
+    send_msg(chat_id, "Como dividir em tarefas?", reply_markup=keyboard)
+
+
+def criar_ask_otmz_nome(chat_id):
+    set_conv(chat_id, "criar_otmz_nome")
+    send_msg(chat_id, "Nome da otimizacao (ex: TROCA DE PRECO, HISTORIA):")
+
+
+def criar_ask_var_ref(chat_id):
+    set_conv(chat_id, "criar_var_ref")
+    send_msg(chat_id, "Referencia do criativo original (ex: C88V2, IMG644V9, AD45):")
+
+
+def criar_preview(chat_id):
+    """Monta preview e pede confirmacao."""
+    conv = get_conv(chat_id)
+    if not conv:
+        return
+    d = conv["data"]
+
+    tipo = d.get("tipo", "?")
+    nicho = d.get("nicho", "?")
+    mercado = d.get("mercado")
+    oferta_sigla = d.get("oferta_sigla", "?")
+    oferta_nome = d.get("oferta_nome", "?")
+    fonte = d.get("fonte", "FB")
+    qty = d.get("qty", 0)
+    hooks = d.get("hooks", "V1")
+    copywriter = d.get("copywriter", "?")
+    rip_prefix = d.get("rip_prefix")
+    otmz_nome = d.get("otmz_nome")
+    var_ref = d.get("var_ref")
+    batch_size = d.get("batch_size", 0)
+
+    # Construir nome(s) previsto(s)
+    mercado_part = f"[{mercado}]" if mercado else ""
+    nicho_part = f"[{nicho}]{mercado_part}"
+
+    if tipo == "vsl":
+        name_preview = f"{nicho_part}[{oferta_sigla}][VSL]"
+        qty_desc = "1 VSL"
+    elif tipo == "otmz":
+        otmz_clean = otmz_nome.upper().replace(" ", "_") if otmz_nome else "?"
+        name_preview = f"{nicho_part}[{oferta_sigla}][OTMZ][{otmz_clean}]"
+        qty_desc = "1 otimizacao"
+    elif tipo in ("lead", "microlead"):
+        sigla = "MLD" if tipo == "microlead" else "LD"
+        name_preview = f"{nicho_part}[{oferta_sigla}][{sigla}01-{sigla}{qty:02d}]"
+        qty_desc = f"{qty} {'microleads' if tipo == 'microlead' else 'leads'}"
+    elif tipo == "ripagem":
+        name_preview = f"{nicho_part}[RP][{oferta_sigla}][{fonte}][{rip_prefix}01-{rip_prefix}{qty:02d}]"
+        qty_desc = f"{qty} ripagens ({rip_prefix})"
+    elif tipo.startswith("variacoes"):
+        is_img = tipo == "variacoes_img"
+        img_tag = "-IMG" if is_img else ""
+        name_preview = f"{nicho_part}[{oferta_sigla}][{fonte}][{var_ref}{img_tag}][V??-V??]"
+        qty_desc = f"{qty} variacoes de {'imagem' if is_img else 'video'}"
+    else:
+        is_img = tipo == "novos_img"
+        img_tag = "-IMG" if is_img else ""
+        hook_count = hooks.count("V")
+        total = qty * hook_count
+        name_preview = f"{nicho_part}[{oferta_sigla}][{fonte}][AD??-AD??{img_tag}][{hooks}]"
+        qty_desc = f"{qty} ADs x {hook_count} hooks = {total} criativos"
+
+    batch_desc = ""
+    if batch_size and batch_size > 0 and qty > batch_size:
+        n_tasks = (qty + batch_size - 1) // batch_size
+        batch_desc = f"\nDivisao: {n_tasks} tarefas de ate {batch_size}"
+
+    preview = (
+        f"PREVIEW DA TAREFA\n\n"
+        f"Tipo: {TIPOS_TAREFA.get(tipo, tipo)}\n"
+        f"Nome: {name_preview}\n"
+        f"Quantidade: {qty_desc}{batch_desc}\n"
+        f"Nicho: {nicho} ({NICHOS.get(nicho, {}).get('nome', '?')})\n"
+        f"Oferta: {oferta_nome}\n"
+        f"Copywriter: {copywriter}\n"
+    )
+
+    if fonte and tipo not in ("vsl", "otmz", "lead", "microlead"):
+        preview += f"Fonte: {fonte}\n"
+
+    keyboard = {"inline_keyboard": [
+        [
+            {"text": "Confirmar", "callback_data": "criar|confirmar|sim"},
+            {"text": "Cancelar", "callback_data": "criar|cancelar|"},
+        ],
+    ]}
+    send_msg(chat_id, preview, reply_markup=keyboard)
+    set_conv(chat_id, "criar_confirm")
+
+
+def criar_execute(chat_id):
+    """Executa a criacao da tarefa no ClickUp."""
+    conv = get_conv(chat_id)
+    if not conv:
+        send_msg(chat_id, "Erro: sessao expirada.")
+        return
+    d = conv["data"]
+
+    tipo = d["tipo"]
+    nicho = d["nicho"]
+    mercado = d.get("mercado")
+    oferta_sigla = d["oferta_sigla"]
+    oferta_nome = d["oferta_nome"]
+    fonte = d.get("fonte", "FB")
+    qty = d.get("qty", 1)
+    hooks = d.get("hooks", "V1")
+    copywriter = d.get("copywriter")
+    rip_prefix = d.get("rip_prefix")
+    otmz_nome = d.get("otmz_nome")
+    var_ref = d.get("var_ref")
+    batch_size = d.get("batch_size", 0)
+
+    mercado_part = f"[{mercado}]" if mercado else ""
+    nicho_part = f"[{nicho}]{mercado_part}"
+
+    send_msg(chat_id, "Criando tarefa(s)...")
+
+    try:
+        if tipo == "vsl":
+            name = f"{nicho_part}[{oferta_sigla}][VSL]"
+            task = create_task_with_checklists(
+                name=name, copywriter=copywriter, nicho=nicho,
+                oferta=oferta_nome,
+            )
+            send_msg(chat_id, f"Tarefa criada:\n{name}\n{task.get('url', '')}")
+
+        elif tipo == "otmz":
+            otmz_clean = otmz_nome.upper().replace(" ", "_")
+            name = f"{nicho_part}[{oferta_sigla}][OTMZ][{otmz_clean}]"
+            task = create_task_with_checklists(
+                name=name, copywriter=copywriter, nicho=nicho,
+                oferta=oferta_nome,
+            )
+            send_msg(chat_id, f"Tarefa criada:\n{name}\n{task.get('url', '')}")
+
+        elif tipo in ("lead", "microlead"):
+            sigla = "MLD" if tipo == "microlead" else "LD"
+            name = f"{nicho_part}[{oferta_sigla}][{sigla}01-{sigla}{qty:02d}]"
+            task = create_task_with_checklists(
+                name=name, copywriter=copywriter, nicho=nicho,
+                oferta=oferta_nome,
+            )
+            send_msg(chat_id, f"Tarefa criada:\n{name}\n{task.get('url', '')}")
+
+        elif tipo == "ripagem":
+            name = f"{nicho_part}[RP][{oferta_sigla}][{fonte}][{rip_prefix}01-{rip_prefix}{qty:02d}]"
+            task = create_task_with_checklists(
+                name=name, copywriter=copywriter, nicho=nicho,
+                oferta=oferta_nome, fonte=fonte,
+            )
+            send_msg(chat_id, f"Tarefa criada:\n{name}\n{task.get('url', '')}")
+
+        elif tipo.startswith("variacoes"):
+            is_img = tipo == "variacoes_img"
+            img_tag = "-IMG" if is_img else ""
+            # Buscar ultima versao
+            from clickup_criar_tarefa import get_last_version
+            last_v = get_last_version(nicho, var_ref)
+            tasks_created = []
+            remaining = qty
+            current_v = last_v + 1
+
+            effective_batch = batch_size if batch_size > 0 else qty
+            while remaining > 0:
+                batch = min(remaining, effective_batch)
+                v_start = current_v
+                v_end = current_v + batch - 1
+                name = f"{nicho_part}[{oferta_sigla}][{fonte}][{var_ref}{img_tag}][V{v_start}-V{v_end}]"
+                task = create_task_with_checklists(
+                    name=name, copywriter=copywriter, nicho=nicho,
+                    oferta=oferta_nome, fonte=fonte,
+                )
+                tasks_created.append(name)
+                current_v = v_end + 1
+                remaining -= batch
+
+            msg = f"{len(tasks_created)} tarefa(s) criada(s):\n" + "\n".join(tasks_created)
+            send_msg(chat_id, msg)
+
+        elif tipo in ("novos_video", "novos_img"):
+            is_img = tipo == "novos_img"
+            last_ad = get_last_ad_number(nicho, fonte)
+            hook_count = hooks.count("V")
+            tasks_created = []
+            remaining = qty
+            current_ad = last_ad + 1
+
+            effective_batch = batch_size if batch_size > 0 else qty
+            while remaining > 0:
+                batch = min(remaining, effective_batch)
+                ad_start = current_ad
+                ad_end = current_ad + batch - 1
+                if ad_start == ad_end:
+                    ad_part = f"AD{ad_start}"
+                else:
+                    ad_part = f"AD{ad_start}-AD{ad_end}"
+                if is_img:
+                    ad_part += "-IMG"
+                name = f"{nicho_part}[{oferta_sigla}][{fonte}][{ad_part}][{hooks}]"
+                task = create_task_with_checklists(
+                    name=name, copywriter=copywriter, nicho=nicho,
+                    oferta=oferta_nome, fonte=fonte,
+                )
+                tasks_created.append(name)
+                current_ad = ad_end + 1
+                remaining -= batch
+
+            total = qty * hook_count
+            msg = f"{len(tasks_created)} tarefa(s) criada(s) ({total} criativos):\n" + "\n".join(tasks_created)
+            send_msg(chat_id, msg)
+
+        else:
+            send_msg(chat_id, f"Tipo nao implementado: {tipo}")
+
+    except Exception as e:
+        send_msg(chat_id, f"Erro ao criar tarefa: {e}")
+
+    clear_conv(chat_id)
+
+
+def handle_criar_callback(chat_id, field, value):
+    """Processa callbacks do fluxo /criar."""
+    conv = get_conv(chat_id)
+
+    if value == "" and field == "cancelar":
+        clear_conv(chat_id)
+        send_msg(chat_id, "Criacao cancelada.")
+        return
+
+    if field == "tipo":
+        set_conv(chat_id, "criar_nicho", {"tipo": value})
+        criar_ask_nicho(chat_id)
+
+    elif field == "nicho":
+        oferta_sigla = ""
+        # Detectar oferta sigla baseado no nicho
+        nicho_info = NICHOS.get(value, {})
+        oferta_nome = nicho_info.get("oferta", "?")
+        # Determinar sigla da oferta (OF01, OF02, etc.)
+        oferta_map = {
+            "EM": "OF02", "DB": "OFC01", "NE": "OF03", "MM": "OF01",
+            "ME": "OF01", "DA": "OF02", "ED": "OF01", "PT": "OF01",
+            "ZB": "OF01",
+        }
+        oferta_sigla = oferta_map.get(value, "OF01")
+
+        set_conv(chat_id, "criar_mercado", {
+            "nicho": value,
+            "oferta_sigla": oferta_sigla,
+            "oferta_nome": oferta_nome,
+        })
+
+        if value in NICHOS_COM_MERCADO_SET:
+            criar_ask_mercado(chat_id)
+        else:
+            # Pular mercado, ir pra proximo step
+            tipo = get_conv(chat_id)["data"]["tipo"]
+            _criar_after_mercado(chat_id, tipo)
+
+    elif field == "mercado":
+        set_conv(chat_id, "criar_fonte", {"mercado": value})
+        tipo = get_conv(chat_id)["data"]["tipo"]
+        _criar_after_mercado(chat_id, tipo)
+
+    elif field == "fonte":
+        set_conv(chat_id, "criar_fonte_done", {"fonte": value})
+        tipo = get_conv(chat_id)["data"]["tipo"]
+        if tipo.startswith("variacoes"):
+            criar_ask_var_ref(chat_id)
+        else:
+            criar_ask_qty(chat_id, tipo)
+
+    elif field == "hooks":
+        set_conv(chat_id, "criar_copy", {"hooks": value})
+        criar_ask_copywriter(chat_id)
+
+    elif field == "rip":
+        set_conv(chat_id, "criar_qty", {"rip_prefix": value})
+        criar_ask_qty(chat_id, "ripagem")
+
+    elif field == "copy":
+        set_conv(chat_id, "criar_batch", {"copywriter": value})
+        tipo = get_conv(chat_id)["data"]["tipo"]
+        qty = get_conv(chat_id)["data"].get("qty", 1)
+        # Tipos que nao precisam de batch
+        if tipo in ("vsl", "otmz", "lead", "microlead") or qty <= 1:
+            set_conv(chat_id, "criar_preview", {"batch_size": 0})
+            criar_preview(chat_id)
+        else:
+            criar_ask_batch(chat_id)
+
+    elif field == "batch":
+        set_conv(chat_id, "criar_preview", {"batch_size": int(value)})
+        criar_preview(chat_id)
+
+    elif field == "confirmar":
+        criar_execute(chat_id)
+
+
+def _criar_after_mercado(chat_id, tipo):
+    """Decide proximo passo apos selecao de mercado."""
+    if tipo == "vsl":
+        criar_ask_copywriter(chat_id)
+    elif tipo == "otmz":
+        criar_ask_otmz_nome(chat_id)
+    elif tipo in ("lead", "microlead"):
+        criar_ask_qty(chat_id, tipo)
+    elif tipo == "ripagem":
+        criar_ask_rip_prefix(chat_id)
+    elif tipo.startswith("variacoes"):
+        criar_ask_fonte(chat_id)
+    else:
+        criar_ask_fonte(chat_id)
+
+
+def handle_criar_text(chat_id, text):
+    """Processa input de texto durante o fluxo /criar."""
+    conv = get_conv(chat_id)
+    if not conv:
+        return False
+
+    step = conv["step"]
+
+    if step == "criar_qty":
+        try:
+            qty = int(text.strip())
+            if qty <= 0:
+                send_msg(chat_id, "Quantidade deve ser maior que zero.")
+                return True
+            set_conv(chat_id, "criar_hooks", {"qty": qty})
+            tipo = conv["data"]["tipo"]
+            if tipo in ("novos_video", "novos_img"):
+                criar_ask_hooks(chat_id)
+            elif tipo in ("lead", "microlead"):
+                criar_ask_copywriter(chat_id)
+            elif tipo == "ripagem":
+                criar_ask_copywriter(chat_id)
+            elif tipo.startswith("variacoes"):
+                criar_ask_copywriter(chat_id)
+            else:
+                criar_ask_copywriter(chat_id)
+        except ValueError:
+            send_msg(chat_id, "Digite um numero valido.")
+        return True
+
+    elif step == "criar_otmz_nome":
+        otmz_clean = text.strip().upper().replace(" ", "_")
+        # Remover acentos simples
+        for old, new in [("Á", "A"), ("É", "E"), ("Í", "I"), ("Ó", "O"), ("Ú", "U"),
+                         ("Ã", "A"), ("Õ", "O"), ("Ç", "C"), ("Â", "A"), ("Ê", "E")]:
+            otmz_clean = otmz_clean.replace(old, new)
+        set_conv(chat_id, "criar_copy", {"otmz_nome": otmz_clean})
+        criar_ask_copywriter(chat_id)
+        return True
+
+    elif step == "criar_var_ref":
+        ref = text.strip().upper().replace(" ", "")
+        set_conv(chat_id, "criar_qty", {"var_ref": ref})
+        criar_ask_qty(chat_id, conv["data"]["tipo"])
+        return True
+
+    return False
+
+
+# ============================================================
+# /AUDITORIA — Rodar auditoria de nomenclatura
+# ============================================================
+
+def cmd_auditoria(chat_id):
+    send_msg(chat_id, "Executando auditoria de nomenclatura...")
+    issues = []
+
+    for list_id, list_name in [(LIST_COPY, "COPY")]:
+        tasks = fetch_tasks(list_id)
+        for task in tasks:
+            name = task["name"].strip()
+            if not name.startswith("["):
+                continue
+            problems = validate_task_name(name)
+            if problems:
+                issues.append({
+                    "id": task["id"],
+                    "name": name,
+                    "list": list_name,
+                    "problems": problems,
+                    "url": task.get("url", ""),
+                })
+
+    if not issues:
+        send_msg(chat_id, "Nenhum problema de nomenclatura encontrado.")
+        return
+
+    lines = [f"AUDITORIA DE NOMENCLATURA\n{len(issues)} tarefa(s) com problemas:\n"]
+    for i, issue in enumerate(issues[:15], 1):
+        lines.append(f"{i}. [{issue['list']}] {issue['name'][:60]}")
+        for p in issue["problems"]:
+            lines.append(f"   -> {p}")
+        lines.append("")
+
+    if len(issues) > 15:
+        lines.append(f"... e mais {len(issues) - 15} tarefas.")
+
+    # Oferecer correcao
+    fixable = [i for i in issues if _can_autofix(i)]
+    if fixable:
+        lines.append(f"\n{len(fixable)} tarefa(s) podem ser corrigidas automaticamente.")
+        keyboard = {"inline_keyboard": [
+            [{"text": f"Corrigir {len(fixable)} tarefas", "callback_data": "fix|all|"}],
+            [{"text": "Cancelar", "callback_data": "fix|cancel|"}],
+        ]}
+        # Salvar issues fixaveis no state
+        _conversations[chat_id] = {"step": "fix_pending", "data": {"fixable": fixable}}
+        send_msg(chat_id, "\n".join(lines), reply_markup=keyboard)
+    else:
+        send_msg(chat_id, "\n".join(lines))
+
+
+# ============================================================
+# /CORRIGIR — Auto-fix de nomenclatura
+# ============================================================
+
+AUTOFIX_RULES = [
+    # Mercado na posicao do nicho: [BR]EM] -> [EM][BR]
+    (r'^\[BR\](\w{2})\]', lambda m: f'[{m.group(1)}][BR]'),
+    (r'^\[EUA\](\w{2})\]', lambda m: f'[{m.group(1)}][EUA]'),
+    # OTMZ junto: [OTMZ - NOME] ou [OTMZNOME] -> [OTMZ][NOME]
+    (r'\[OTMZ\s*[-—]\s*([^\]]+)\]', lambda m: f'[OTMZ][{m.group(1).strip().upper().replace(" ", "_")}]'),
+    (r'\[OTMZ([A-Z_][^\]]*)\]', lambda m: f'[OTMZ][{m.group(1).strip("_- ")}]'),
+    # Espaco no range: [AD231- AD235] -> [AD231-AD235]
+    (r'\[AD(\d+)\s*-\s*AD(\d+)\]', lambda m: f'[AD{m.group(1)}-AD{m.group(2)}]'),
+    # [ML01-05] -> [MLD01-MLD05]
+    (r'\[ML(\d+)-(\d+)\]', lambda m: f'[MLD{m.group(1)}-MLD{m.group(2)}]'),
+    # NP -> NE
+    (r'\[NP\]', lambda m: '[NE]'),
+    # Remover acentos de OTMZ nome
+    (r'\[OTMZ\]\[([^\]]*[ÁÉÍÓÚÃÕÇÂÊ][^\]]*)\]',
+     lambda m: f'[OTMZ][{_remove_accents(m.group(1))}]'),
+]
+
+
+def _remove_accents(s):
+    for old, new in [("Á", "A"), ("É", "E"), ("Í", "I"), ("Ó", "O"), ("Ú", "U"),
+                     ("Ã", "A"), ("Õ", "O"), ("Ç", "C"), ("Â", "A"), ("Ê", "E"),
+                     ("á", "a"), ("é", "e"), ("í", "i"), ("ó", "o"), ("ú", "u"),
+                     ("ã", "a"), ("õ", "o"), ("ç", "c"), ("â", "a"), ("ê", "e")]:
+        s = s.replace(old, new)
+    return s.upper()
+
+
+def _can_autofix(issue):
+    """Verifica se um issue pode ser corrigido automaticamente."""
+    fixed = _apply_autofix(issue["name"])
+    return fixed != issue["name"]
+
+
+def _apply_autofix(name):
+    """Aplica todas as regras de autofix e retorna o nome corrigido."""
+    fixed = name
+    for pattern, replacement in AUTOFIX_RULES:
+        fixed = re.sub(pattern, replacement, fixed)
+    return fixed
+
+
+def cmd_corrigir(chat_id):
+    """Busca e corrige problemas de nomenclatura."""
+    send_msg(chat_id, "Buscando tarefas com nomenclatura incorreta...")
+    issues = []
+
+    for list_id, list_name in [(LIST_COPY, "COPY")]:
+        tasks = fetch_tasks(list_id)
+        for task in tasks:
+            name = task["name"].strip()
+            if not name.startswith("["):
+                continue
+            fixed = _apply_autofix(name)
+            if fixed != name:
+                issues.append({
+                    "id": task["id"],
+                    "name": name,
+                    "fixed": fixed,
+                    "list": list_name,
+                    "url": task.get("url", ""),
+                })
+
+    if not issues:
+        send_msg(chat_id, "Nenhuma tarefa precisando de correcao automatica.")
+        return
+
+    lines = [f"CORRECOES DISPONIVEIS\n{len(issues)} tarefa(s):\n"]
+    for i, issue in enumerate(issues[:15], 1):
+        lines.append(f"{i}. {issue['name'][:50]}")
+        lines.append(f"   -> {issue['fixed'][:50]}")
+        lines.append("")
+
+    keyboard = {"inline_keyboard": [
+        [{"text": f"Corrigir {len(issues)} tarefas", "callback_data": "fix|execute|"}],
+        [{"text": "Cancelar", "callback_data": "fix|cancel|"}],
+    ]}
+    _conversations[chat_id] = {"step": "fix_pending", "data": {"fixable_corrigir": issues}}
+    send_msg(chat_id, "\n".join(lines), reply_markup=keyboard)
+
+
+def fix_execute(chat_id, issues):
+    """Executa as correcoes no ClickUp."""
+    fixed_count = 0
+    errors = []
+
+    for issue in issues:
+        new_name = issue.get("fixed") or _apply_autofix(issue["name"])
+        if new_name == issue["name"]:
+            continue
+        try:
+            api_request("PUT", f"/task/{issue['id']}", {"name": new_name})
+            fixed_count += 1
+        except Exception as e:
+            errors.append(f"{issue['name'][:40]}: {e}")
+
+    msg = f"Correcoes aplicadas: {fixed_count}/{len(issues)}"
+    if errors:
+        msg += f"\n\nErros ({len(errors)}):\n" + "\n".join(errors[:5])
+    send_msg(chat_id, msg)
+
+
+# ============================================================
+# /PRODUCAO — Relatorio de producao semanal
+# ============================================================
+
+def cmd_producao(chat_id):
+    send_msg(chat_id, "Gerando relatorio de producao...")
+    try:
+        import subprocess
+        result = subprocess.run(
+            [sys.executable, os.path.expanduser("~/Scripts/relatorio_semanal_producao.py"), "--dry"],
+            capture_output=True, text=True, timeout=60,
+        )
+        output = result.stdout
+        if output:
+            # Enviar via Telegram (limitar tamanho)
+            send_msg(chat_id, output[:4000])
+            if len(output) > 4000:
+                send_msg(chat_id, output[4000:8000])
+        else:
+            send_msg(chat_id, "Nenhuma tarefa encontrada no periodo.")
+    except Exception as e:
+        send_msg(chat_id, f"Erro ao gerar relatorio: {e}")
+
+
+# ============================================================
+# /RELATORIO — Selector de relatorios
+# ============================================================
+
+def cmd_relatorio(chat_id):
+    keyboard = {"inline_keyboard": [
+        [{"text": "Producao Semanal", "callback_data": "rel|producao|"}],
+        [{"text": "Arquivo Morto (Mensal)", "callback_data": "rel|mensal|"}],
+        [{"text": "Auditoria Nomenclatura", "callback_data": "rel|auditoria|"}],
+    ]}
+    send_msg(chat_id, "Qual relatorio deseja gerar?", reply_markup=keyboard)
+
+
+# ============================================================
+# /STATUS
+# ============================================================
+
+# ============================================================
+# /RELATORIO_PERFORMANCE_CRIATIVOS
+# ============================================================
+
+_pending_perf_criativos = {}  # chat_id -> True (esperando período digitado)
+
+
+def cmd_relatorio_performance_criativos(chat_id):
+    """Relatório de performance por criativo/copywriter."""
+    now = datetime.now()
+    # Smart presets
+    # Semana passada (seg-dom)
+    days_since_sunday = now.weekday() + 1
+    if days_since_sunday == 7:
+        days_since_sunday = 0
+    last_sunday = now - timedelta(days=days_since_sunday)
+    last_monday = last_sunday - timedelta(days=6)
+    sem_passada = f"{last_monday.strftime('%d/%m')} a {last_sunday.strftime('%d/%m')}"
+    sem_passada_key = f"{last_monday.strftime('%Y%m%d')}_{last_sunday.strftime('%Y%m%d')}"
+
+    # Este mês
+    first_day_month = now.replace(day=1)
+    yesterday = now - timedelta(days=1)
+    este_mes = f"01/{now.strftime('%m')} a {yesterday.strftime('%d/%m')}"
+    este_mes_key = f"{first_day_month.strftime('%Y%m%d')}_{yesterday.strftime('%Y%m%d')}"
+
+    # Mês passado
+    last_month_end = first_day_month - timedelta(days=1)
+    last_month_start = last_month_end.replace(day=1)
+    mes_passado = f"{last_month_start.strftime('%d/%m')} a {last_month_end.strftime('%d/%m')}"
+    mes_passado_key = f"{last_month_start.strftime('%Y%m%d')}_{last_month_end.strftime('%Y%m%d')}"
+
+    buttons = [
+        [{"text": f"Semana passada ({sem_passada})", "callback_data": f"rpc|period|{sem_passada_key}"}],
+        [{"text": f"Este mês ({este_mes})", "callback_data": f"rpc|period|{este_mes_key}"}],
+        [{"text": f"Mês passado ({mes_passado})", "callback_data": f"rpc|period|{mes_passado_key}"}],
+        [{"text": "Digitar período (DD/MM-DD/MM)", "callback_data": "rpc|custom|0"}],
+    ]
+    send_msg(chat_id, "RELATÓRIO PERFORMANCE CRIATIVOS\n\nSelecione o período:", reply_markup={"inline_keyboard": buttons})
+
+
+def rpc_execute(chat_id, date_from, date_to):
+    """Executa geração do relatório em background."""
+    import subprocess
+    df_label = datetime.strptime(date_from, "%Y-%m-%d").strftime("%d/%m")
+    dt_label = datetime.strptime(date_to, "%Y-%m-%d").strftime("%d/%m")
+    send_msg(chat_id, f"Gerando relatório de performance por criativo ({df_label} a {dt_label})...\nIsso pode levar ~2 minutos.")
+
+    try:
+        result = subprocess.run(
+            [sys.executable, os.path.expanduser("~/Scripts/relatorio_performance_criativos.py"),
+             datetime.strptime(date_from, "%Y-%m-%d").strftime("%d/%m/%Y"),
+             datetime.strptime(date_to, "%Y-%m-%d").strftime("%d/%m/%Y"),
+             "--notify"],
+            capture_output=True, text=True, timeout=600,
+        )
+        if result.returncode != 0:
+            error = result.stderr or result.stdout or "Erro desconhecido"
+            send_msg(chat_id, f"Erro ao gerar relatório:\n{error[:2000]}")
+        else:
+            send_msg(chat_id, "Relatório gerado e enviado!")
+    except subprocess.TimeoutExpired:
+        send_msg(chat_id, "Timeout: relatório demorou mais de 10 minutos.")
+    except Exception as e:
+        send_msg(chat_id, f"Erro: {e}")
+
+
+def cmd_briefing(chat_id):
+    """Gera e envia briefing diário sob demanda."""
+    send_msg(chat_id, "Gerando briefing diário...")
+
+    try:
+        import subprocess
+        result = subprocess.run(
+            [sys.executable, os.path.expanduser("~/Scripts/briefing_diario.py")],
+            capture_output=True, text=True, timeout=60,
+            env={**os.environ},
+        )
+
+        # Ler o arquivo gerado (formato HTML para Telegram)
+        briefing_path = os.path.expanduser("~/Scripts/data/briefing_diario_latest.txt")
+        if os.path.exists(briefing_path):
+            with open(briefing_path) as f:
+                content = f.read()
+            # O briefing_diario.py já enviou via Telegram com HTML,
+            # mas usou o bot principal. Reenviar pelo bot GPDR em texto limpo.
+            send_msg_long(chat_id, content)
+        else:
+            send_msg(chat_id, "Erro: arquivo de briefing nao gerado.")
+
+        if result.returncode != 0:
+            send_msg(chat_id, f"Aviso: script retornou codigo {result.returncode}\n{result.stderr[:200]}")
+
+    except subprocess.TimeoutExpired:
+        send_msg(chat_id, "Timeout ao gerar briefing (>60s).")
+    except Exception as e:
+        send_msg(chat_id, f"Erro ao gerar briefing: {e}")
+
+
+def send_msg_long(chat_id, text, chunk_size=4000):
+    """Envia mensagem longa dividindo em chunks."""
+    if len(text) <= chunk_size:
+        send_msg(chat_id, text)
+        return
+    lines = text.split("\n")
+    current = ""
+    for line in lines:
+        if len(current) + len(line) + 1 > chunk_size:
+            send_msg(chat_id, current)
+            current = line
+        else:
+            current += "\n" + line if current else line
+    if current:
+        send_msg(chat_id, current)
+
+
+def cmd_status(chat_id):
+    now = datetime.now()
+    uptime = ""
+    if BOT_START_TIME:
+        delta = now - BOT_START_TIME
+        hours = int(delta.total_seconds() // 3600)
+        mins = int((delta.total_seconds() % 3600) // 60)
+        uptime = f"Uptime: {hours}h{mins:02d}m"
+
+    convs = len(_conversations)
+    lines = [
+        f"STATUS BOT GPDR | {now.strftime('%d/%m/%Y %H:%M')}",
+        "",
+        "Bot: online",
+        uptime,
+        f"Conversas ativas: {convs}",
+        f"ClickUp API: {'OK' if CLICKUP_TOKEN else 'NAO CONFIGURADO'}",
+        f"Nichos: {', '.join(sorted(NICHOS.keys()))}",
+        f"Copywriters: {', '.join(sorted(set(k for k in COPYWRITERS if k == k.upper() and k != 'CASSIO')))}",
+    ]
+    send_msg(chat_id, "\n".join(lines))
+
+
+# ============================================================
+# BOT POLLING
+# ============================================================
+
+def load_offset():
+    if os.path.exists(OFFSET_FILE):
+        with open(OFFSET_FILE) as f:
+            return int(f.read().strip())
+    return 0
+
+
+def save_offset(offset):
+    os.makedirs(os.path.dirname(OFFSET_FILE), exist_ok=True)
+    with open(OFFSET_FILE, "w") as f:
+        f.write(str(offset))
+
+
+def handle_message(chat_id, text):
+    # Verificar se ha conversa ativa esperando texto
+    conv = get_conv(chat_id)
+    if conv and conv["step"].startswith("criar_"):
+        if handle_criar_text(chat_id, text):
+            return
+
+    # Verificar se está esperando período digitado para rpc
+    if chat_id in _pending_perf_criativos:
+        del _pending_perf_criativos[chat_id]
+        # Parse DD/MM-DD/MM or DD/MM a DD/MM
+        text_clean_rpc = text.strip()
+        m = re.match(r"(\d{2}/\d{2}(?:/\d{4})?)\s*[-aA]\s*(\d{2}/\d{2}(?:/\d{4})?)", text_clean_rpc)
+        if m:
+            d1, d2 = m.group(1), m.group(2)
+            year = datetime.now().year
+            try:
+                if len(d1) == 5: d1 = f"{d1}/{year}"
+                if len(d2) == 5: d2 = f"{d2}/{year}"
+                df = datetime.strptime(d1, "%d/%m/%Y").strftime("%Y-%m-%d")
+                dt = datetime.strptime(d2, "%d/%m/%Y").strftime("%Y-%m-%d")
+                rpc_execute(chat_id, df, dt)
+            except ValueError:
+                send_msg(chat_id, "Formato inválido. Use DD/MM-DD/MM ou DD/MM/YYYY-DD/MM/YYYY")
+        else:
+            send_msg(chat_id, "Formato inválido. Use DD/MM-DD/MM (ex: 01/04-21/04)")
+        return
+
+    text_clean = text.strip().lower().lstrip("/")
+    parts = text_clean.split()
+    cmd = parts[0] if parts else ""
+
+    if cmd in ("help", "start"):
+        send_msg(chat_id,
+            "GPDR IMPERA — Comandos:\n\n"
+            "/criar - Criar tarefas no ClickUp\n"
+            "/corrigir - Corrigir nomenclatura automaticamente\n"
+            "/auditoria - Verificar nomenclatura de tarefas\n"
+            "/producao - Relatorio de producao semanal\n"
+            "/relatorio - Gerar relatorios\n"
+            "/relatorio_performance_criativos - Performance por criativo/copywriter\n"
+            "/briefing - Briefing diario (performance, gestores, ads, esteira)\n"
+            "/status - Status do bot\n"
+            "/help - Esta mensagem\n\n"
+            "Tambem funciona com texto livre:\n"
+            "  '30 videos novos EM 2 hooks cassio'\n"
+            "  'auditoria de nomenclatura'\n"
+        )
+    elif cmd == "criar":
+        cmd_criar_start(chat_id)
+    elif cmd == "corrigir":
+        cmd_corrigir(chat_id)
+    elif cmd == "auditoria":
+        cmd_auditoria(chat_id)
+    elif cmd == "producao":
+        cmd_producao(chat_id)
+    elif cmd == "relatorio":
+        cmd_relatorio(chat_id)
+    elif cmd == "status":
+        cmd_status(chat_id)
+    elif cmd in ("relatorio_performance_criativos", "rpc"):
+        cmd_relatorio_performance_criativos(chat_id)
+    elif cmd == "briefing":
+        cmd_briefing(chat_id)
+    elif cmd == "cancelar":
+        if get_conv(chat_id):
+            clear_conv(chat_id)
+            send_msg(chat_id, "Operacao cancelada.")
+    else:
+        # Ignorar mensagens desconhecidas (nao interferir)
+        pass
+
+
+def handle_callback(callback_id, chat_id, data):
+    parts = data.split("|")
+    cmd = parts[0]
+    field = parts[1] if len(parts) > 1 else ""
+    value = parts[2] if len(parts) > 2 else ""
+
+    answer_callback(callback_id)
+
+    if cmd == "criar":
+        handle_criar_callback(chat_id, field, value)
+
+    elif cmd == "fix":
+        if field == "cancel":
+            clear_conv(chat_id)
+            send_msg(chat_id, "Correcao cancelada.")
+        elif field in ("all", "execute"):
+            conv = get_conv(chat_id)
+            if conv:
+                fixable = conv["data"].get("fixable") or conv["data"].get("fixable_corrigir", [])
+                if fixable:
+                    fix_execute(chat_id, fixable)
+                else:
+                    send_msg(chat_id, "Nenhuma correcao pendente.")
+            clear_conv(chat_id)
+
+    elif cmd == "rpc":
+        if field == "period":
+            # value = "20260414_20260420"
+            d1 = datetime.strptime(value[:8], "%Y%m%d").strftime("%Y-%m-%d")
+            d2 = datetime.strptime(value[9:], "%Y%m%d").strftime("%Y-%m-%d")
+            rpc_execute(chat_id, d1, d2)
+        elif field == "custom":
+            _pending_perf_criativos[chat_id] = True
+            send_msg(chat_id, "Digite o período no formato DD/MM-DD/MM\nExemplo: 01/04-21/04")
+
+    elif cmd == "rel":
+        if field == "producao":
+            cmd_producao(chat_id)
+        elif field == "mensal":
+            send_msg(chat_id, "Gerando relatorio mensal...")
+            try:
+                import subprocess
+                result = subprocess.run(
+                    [sys.executable, os.path.expanduser("~/Scripts/relatorio_mensal_arquivo_morto_v2.py"), "--dry"],
+                    capture_output=True, text=True, timeout=120,
+                )
+                output = result.stdout or "Sem dados."
+                send_msg(chat_id, output[:4000])
+            except Exception as e:
+                send_msg(chat_id, f"Erro: {e}")
+        elif field == "auditoria":
+            cmd_auditoria(chat_id)
+
+
+def bot_poll_once():
+    offset = load_offset()
+    try:
+        result = tg_request("getUpdates", {"offset": offset + 1, "timeout": 30})
+    except Exception:
+        return
+
+    for update in result.get("result", []):
+        uid = update["update_id"]
+
+        msg = update.get("message", {})
+        if msg:
+            chat_id = msg.get("chat", {}).get("id")
+            text = msg.get("text", "")
+            if chat_id and text:
+                handle_message(chat_id, text)
+
+        cb = update.get("callback_query", {})
+        if cb:
+            cb_id = cb.get("id")
+            chat_id = cb.get("message", {}).get("chat", {}).get("id")
+            data = cb.get("data", "")
+            if chat_id and data:
+                handle_callback(cb_id, chat_id, data)
+
+        save_offset(uid)
+
+
+def cmd_bot():
+    global BOT_START_TIME
+    if not TELEGRAM_TOKEN:
+        print("TELEGRAM_GPDR_TOKEN nao configurado.")
+        sys.exit(1)
+
+    BOT_START_TIME = datetime.now()
+    print(f"[{BOT_START_TIME.isoformat()}] Bot GPDR IMPERA iniciado.")
+
+    cmds = [
+        {"command": "criar", "description": "Criar tarefas no ClickUp"},
+        {"command": "corrigir", "description": "Corrigir nomenclatura automaticamente"},
+        {"command": "auditoria", "description": "Verificar nomenclatura de tarefas"},
+        {"command": "producao", "description": "Relatorio de producao semanal"},
+        {"command": "relatorio", "description": "Gerar relatorios"},
+        {"command": "relatorio_performance_criativos", "description": "Performance por criativo/copywriter"},
+        {"command": "status", "description": "Status do bot"},
+        {"command": "help", "description": "Lista de comandos"},
+    ]
+    tg_request("setMyCommands", {"commands": cmds})
+    print("Comandos registrados.")
+
+    while True:
+        try:
+            bot_poll_once()
+        except KeyboardInterrupt:
+            print("\nBot encerrado.")
+            break
+        except Exception as e:
+            print(f"[{datetime.now().isoformat()}] Erro: {e}")
+            _time.sleep(5)
+
+
+# ============================================================
+# AUTOFIX (crontab) — correcao silenciosa
+# ============================================================
+
+def autofix_run():
+    """Roda autofix e envia resultado via Telegram se houver correcoes."""
+    print(f"[{datetime.now().isoformat()}] Autofix de nomenclatura...")
+    issues = []
+
+    for list_id, list_name in [(LIST_COPY, "COPY")]:
+        tasks = fetch_tasks(list_id)
+        for task in tasks:
+            name = task["name"].strip()
+            if not name.startswith("["):
+                continue
+            fixed = _apply_autofix(name)
+            if fixed != name:
+                issues.append({
+                    "id": task["id"],
+                    "name": name,
+                    "fixed": fixed,
+                    "list": list_name,
+                })
+
+    if not issues:
+        print("  Nenhuma correcao necessaria.")
+        return
+
+    fixed_count = 0
+    errors = []
+    for issue in issues:
+        try:
+            api_request("PUT", f"/task/{issue['id']}", {"name": issue["fixed"]})
+            fixed_count += 1
+            print(f"  Corrigido: {issue['name'][:50]} -> {issue['fixed'][:50]}")
+        except Exception as e:
+            errors.append(f"{issue['name'][:40]}: {e}")
+
+    if TELEGRAM_CHAT_ID and fixed_count > 0:
+        lines = [f"AUTOFIX NOMENCLATURA\n{fixed_count} tarefa(s) corrigida(s):\n"]
+        for issue in issues[:10]:
+            lines.append(f"  {issue['name'][:45]}")
+            lines.append(f"  -> {issue['fixed'][:45]}")
+            lines.append("")
+        msg = "\n".join(lines)
+        try:
+            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+            body = json.dumps({"chat_id": TELEGRAM_CHAT_ID, "text": msg}).encode()
+            req = urllib.request.Request(url, data=body, method="POST")
+            req.add_header("Content-Type", "application/json")
+            urllib.request.urlopen(req)
+        except Exception:
+            pass
+
+    print(f"  Total: {fixed_count} correcoes, {len(errors)} erros.")
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+if __name__ == "__main__":
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "bot"
+
+    if cmd == "bot":
+        cmd_bot()
+    elif cmd == "autofix":
+        autofix_run()
+    else:
+        print(__doc__)

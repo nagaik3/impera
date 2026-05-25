@@ -1,0 +1,47 @@
+# IMPERA Context Configuration
+# Source this file to load IMPERA-specific context and tools
+# Usage: source ~/.impera-context
+
+# === IMPERA DIRECTORIES ===
+export IMPERA_HOME="$HOME/impera-core"
+export IMPERA_DATA="$HOME/Scripts/data"
+export IMPERA_SCRIPTS="$HOME/Scripts"
+export IMPERA_DOCS="$HOME/Obsidian/IMPERA"
+
+# === QUICK ALIASES ===
+alias c="cd $IMPERA_DATA"
+alias cdata="cd $IMPERA_DATA"
+alias cscripts="cd $IMPERA_SCRIPTS"
+alias cdocs="cd $IMPERA_DOCS"
+alias cdev="cd $IMPERA_HOME"
+
+# === QUICK FILE ACCESS ===
+alias impera-doc-completo="cat $IMPERA_DATA/SESSAO_GESTORES_2026_05_21_COMPLETA.md"
+alias impera-guia-rapido="cat $IMPERA_DATA/GUIA_RAPIDO_NOMENCLATURA_CONTAGEM.md"
+alias impera-indice="cat $IMPERA_DATA/INDICE_SESSAO_2026_05_21.md"
+
+# === ANALYTICS & DATA ===
+ls-impera-data() {
+    echo "📊 IMPERA Data Files:"
+    ls -lht "$IMPERA_DATA"/*.{md,json,txt} 2>/dev/null | head -10
+}
+
+impera-search() {
+    if [ -z "$1" ]; then
+        echo "Usage: impera-search <keyword>"
+        echo "Searches IMPERA documentation files"
+        return 1
+    fi
+    grep -r "$1" "$IMPERA_DATA" --include="*.md" --include="*.txt"
+}
+
+# === CONTEXT INDICATOR ===
+echo "✅ IMPERA context loaded"
+echo "Directories:"
+echo "  📁 Data:    $IMPERA_DATA"
+echo "  📁 Scripts: $IMPERA_SCRIPTS"
+echo "  📁 Docs:    $IMPERA_DOCS"
+echo "  📁 Dev:     $IMPERA_HOME"
+echo ""
+echo "Quick commands: c, cdata, cscripts, cdocs, ls-impera-data, impera-search"
+echo ""

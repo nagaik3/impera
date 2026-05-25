@@ -1,0 +1,780 @@
+#!/usr/bin/env python3
+"""
+Relatório Mensal Copywriters — IMPERA
+Gera 2 PDFs:
+  PDF 1: Performance Copywriters (Geral) — atribuição por quem FEZ a variação
+  PDF 2: Criativos Pai (Comissão) — atribuição por quem CRIOU o AD original
+
+Uso:
+  python3 relatorio_mensal_copywriters.py                         # mês anterior
+  python3 relatorio_mensal_copywriters.py --periodo 01/04 30/04   # custom
+
+GPDR — Iago Almeida, assistido por Claude
+"""
+
+import sys, os, re, json, calendar
+from datetime import datetime, timedelta
+from collections import defaultdict
+
+sys.path.insert(0, os.path.expanduser("~/Scripts"))
+
+from relatorio_performance_copywriters_pdf import (
+    collect_data, detect_gestor_from_campaign, NICHO_FULL, GESTOR_MAP_RT,
+)
+from relatorio_performance_criativos import (
+    extract_creative_id, clean_ag_name, parse_camp, find_copywriter,
+    fetch_cu_tasks, parse_cu_task, COPY_LIST, TRAFEGO_LIST, RIP_COPY,
+)
+from impera_cache import cached_rt_adgroups, cached_cu_tasks, rt_fetch_single, REDTRACK_KEY
+from auto_etiqueta import detect_tags
+
+COPY_TEAM = ["YAN", "CASSIO", "ELIAS", "ANA", "CRISPIM"]
+
+# --- PDF helpers (reportlab) ---
+from reportlab.lib.pagesizes import A4, landscape
+from reportlab.lib.units import mm, cm
+from reportlab.lib.colors import HexColor, white, black
+from reportlab.lib.enums import TA_CENTER, TA_LEFT
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, PageBreak
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+
+DARK_BLUE = HexColor("#1B3A5C")
+MEDIUM_BLUE = HexColor("#2C5F8A")
+LIGHT_BLUE = HexColor("#E8F0F8")
+ALT_ROW = HexColor("#F2F6FA")
+GRAY = HexColor("#6B6B6B")
+
+
+def fmt_v(v):
+    if abs(v) >= 1000:
+        s = f"R${abs(v):,.0f}".replace(",", ".")
+    else:
+        s = f"R${abs(v):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+    return s if v >= 0 else f"-{s}"
+
+
+def fmt_roas(v):
+    return f"{v:.2f}"
+
+
+def fmt_int(v):
+    return f"{v:,}".replace(",", ".")
+
+
+def fmt_pct(v):
+    return f"{v:.1f}%"
+
+
+styles = getSampleStyleSheet()
+ts = ParagraphStyle("T", parent=styles["Title"], fontSize=18, textColor=DARK_BLUE, spaceAfter=4*mm, alignment=TA_CENTER)
+ss = ParagraphStyle("S", parent=styles["Normal"], fontSize=10, textColor=GRAY, alignment=TA_CENTER, spaceAfter=2*mm)
+sec = ParagraphStyle("Sec", parent=styles["Heading2"], fontSize=13, textColor=DARK_BLUE, spaceBefore=6*mm, spaceAfter=3*mm)
+sec_sm = ParagraphStyle("SecSm", parent=styles["Heading2"], fontSize=11, textColor=DARK_BLUE, spaceBefore=4*mm, spaceAfter=2*mm)
+ns = ParagraphStyle("N", parent=styles["Normal"], fontSize=8, textColor=GRAY, spaceAfter=2*mm, alignment=TA_CENTER)
+cwh = ParagraphStyle("CW", parent=styles["Normal"], fontSize=9, textColor=MEDIUM_BLUE, spaceBefore=3*mm, spaceAfter=1.5*mm, fontName="Helvetica-Bold")
+footer_s = ParagraphStyle("F", parent=styles["Normal"], fontSize=9, textColor=GRAY, alignment=TA_CENTER)
+
+
+def make_table(headers, rows, col_widths=None, font_size=7.5, header_size=7.5, pad=2):
+    data = [headers] + rows
+    t = Table(data, colWidths=col_widths, repeatRows=1)
+    sc = [
+        ("BACKGROUND", (0, 0), (-1, 0), DARK_BLUE), ("TEXTCOLOR", (0, 0), (-1, 0), white),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"), ("FONTSIZE", (0, 0), (-1, 0), header_size),
+        ("FONTSIZE", (0, 1), (-1, -1), font_size), ("FONTNAME", (0, 1), (-1, -1), "Helvetica"),
+        ("ALIGN", (0, 0), (-1, 0), "CENTER"), ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("GRID", (0, 0), (-1, -1), 0.3, HexColor("#CCCCCC")),
+        ("TOPPADDING", (0, 0), (-1, -1), pad), ("BOTTOMPADDING", (0, 0), (-1, -1), pad),
+        ("LEFTPADDING", (0, 0), (-1, -1), 3), ("RIGHTPADDING", (0, 0), (-1, -1), 3),
+    ]
+    for i in range(1, len(data)):
+        if i % 2 == 0:
+            sc.append(("BACKGROUND", (0, i), (-1, i), ALT_ROW))
+    for col in range(2, len(headers)):
+        sc.append(("ALIGN", (col, 0), (col, -1), "RIGHT"))
+    t.setStyle(TableStyle(sc))
+    return t
+
+
+def add_total_row(t, n_rows):
+    t.setStyle(TableStyle([
+        ("FONTNAME", (0, n_rows), (-1, n_rows), "Helvetica-Bold"),
+        ("BACKGROUND", (0, n_rows), (-1, n_rows), LIGHT_BLUE),
+    ]))
+
+
+# ==================== Helpers ====================
+
+def detect_mercado(campaign_name):
+    """Detect market from campaign name: EUA or BR."""
+    upper = campaign_name.upper()
+    if "EMAGRECIMENTOLEM" in upper or "LEM" in upper or "EUA" in upper:
+        return "EUA"
+    return "BR"
+
+
+def detect_fonte_from_campaign(campaign_name):
+    """Detect fonte from campaign name prefix."""
+    upper = campaign_name.upper()
+    fm = re.search(r"\[(FB|GG|YT|TT|KW|MG|TB|OB)\]", upper)
+    if fm:
+        return fm.group(1)
+    # Fallback: check common patterns
+    if upper.startswith("[FB]") or "FACEBOOK" in upper:
+        return "FB"
+    if upper.startswith("[YT]") or "YOUTUBE" in upper:
+        return "YT"
+    if upper.startswith("[KW]") or "KWAI" in upper:
+        return "KW"
+    if upper.startswith("[GG]") or "GOOGLE" in upper:
+        return "GG"
+    if upper.startswith("[TT]") or "TIKTOK" in upper:
+        return "TT"
+    return "FB"
+
+
+def classify_tipo(base_id, version, nicho):
+    """Use detect_tags to classify as Novo / Variação / Ripagem."""
+    nicho_str = nicho or "EM"
+    ver_str = f"[V{version.replace('V', '')}]" if version and version != "-" else ""
+    fake_name = f"[{nicho_str}][OF01][FB][{base_id}]{ver_str}"
+    tags = detect_tags(fake_name)
+    if "ripagem" in tags:
+        return "Ripagem"
+    elif "criativo-novo" in tags:
+        return "Novo"
+    else:
+        return "Variação"
+
+
+def extract_root_base(base_id):
+    """Extract root from a base_id: AD76V10 → AD76, C71V12 → C71, C88 → C88."""
+    m = re.match(r"^((?:AD|CE|CY|CC|C)\d+)V\d+$", base_id)
+    if m:
+        return m.group(1)
+    return base_id
+
+
+def determine_owner_from_root(root):
+    """Determine owner from root prefix. CE→ELIAS, CY→YAN, CC→CASSIO, C##→DOUGLAS*."""
+    for px, cp in RIP_COPY.items():
+        if root.startswith(px) and re.match(rf"^{px}\d+$", root):
+            return cp
+    if re.match(r"^C\d+$", root):
+        return "DOUGLAS*"
+    return None
+
+
+def fetch_campaign_totals(date_from, date_to):
+    """Fetch campaign-level totals from RT API (group=campaign)."""
+    camps = rt_fetch_single({
+        "api_key": REDTRACK_KEY, "group": "campaign",
+        "date_from": date_from, "date_to": date_to, "per": "500",
+    })
+    total_cost = 0
+    total_front = 0
+    total_rev = 0
+    total_vendas = 0
+    for c in camps:
+        cost = float(c.get("cost", 0))
+        if cost < 1:
+            continue
+        total_cost += cost
+        fr = float(c.get("revenuetype2", 0)) + float(c.get("revenuetype3", 0))
+        total_front += fr
+        total_rev += float(c.get("total_revenue", 0))
+        total_vendas += int(c.get("convtype1", 0))
+    mc_br = total_front * 0.74 - total_cost * 1.12
+    return {
+        "cost": total_cost, "front_rev": total_front, "total_rev": total_rev,
+        "mc_br": mc_br, "vendas": total_vendas,
+    }
+
+
+def enrich_creatives_with_extra(creatives, date_from, date_to):
+    """Add gestor, mercado, fonte info from RT campaigns to each creative."""
+    rt_data = cached_rt_adgroups(date_from, date_to, ttl=1800)
+    # Build mapping: (base, version, nicho) -> {gestor, mercado, fonte}
+    info_map = defaultdict(lambda: {"gestores": defaultdict(float), "mercados": defaultdict(float), "fontes": defaultdict(float)})
+    for ag in rt_data["adgroups"]:
+        cost = float(ag.get("cost", 0))
+        if cost < 1:
+            continue
+        cname = ag.get("campaign", "")
+        gestor = detect_gestor_from_campaign(cname)
+        mercado = detect_mercado(cname)
+        nicho = parse_camp(cname)[0] or "?"
+        fonte = detect_fonte_from_campaign(cname)
+        ag_name = ag.get("rt_adgroup", "")
+        clean = clean_ag_name(ag_name)
+        base_id, version = extract_creative_id(clean)
+        if base_id:
+            key = (base_id, version or "-", nicho)
+            fr = float(ag.get("revenuetype2", 0)) + float(ag.get("revenuetype3", 0))
+            if gestor:
+                info_map[key]["gestores"][gestor] += fr
+            info_map[key]["mercados"][mercado] += fr
+            info_map[key]["fontes"][fonte] += fr
+
+    for c in creatives:
+        key = (c["base"], c["version"], c["nicho"])
+        info = info_map.get(key)
+        if info:
+            c["gestor"] = max(info["gestores"].items(), key=lambda x: x[1])[0] if info["gestores"] else "N/A"
+            c["mercado"] = max(info["mercados"].items(), key=lambda x: x[1])[0] if info["mercados"] else "BR"
+            c["fonte"] = max(info["fontes"].items(), key=lambda x: x[1])[0] if info["fontes"] else "FB"
+        else:
+            c["gestor"] = "N/A"
+            c["mercado"] = "BR"
+            c["fonte"] = "FB"
+
+
+# ==================== PDF 1: Performance Copywriters (Geral) ====================
+
+def generate_pdf1(creatives, date_from, date_to, output_path, campaign_totals):
+    doc = SimpleDocTemplate(output_path, pagesize=landscape(A4),
+                            leftMargin=1.2*cm, rightMargin=1.2*cm, topMargin=1.2*cm, bottomMargin=1.0*cm)
+    elements = []
+
+    copy_ads = [c for c in creatives if c["copywriter"] in COPY_TEAM]
+    douglas_ads = [c for c in creatives if c["copywriter"] == "DOUGLAS*"]
+
+    df_dt = datetime.strptime(date_from, "%Y-%m-%d")
+    dt_dt = datetime.strptime(date_to, "%Y-%m-%d")
+    periodo = f"{df_dt.strftime('%d/%b/%Y')} a {dt_dt.strftime('%d/%b/%Y')}"
+
+    # Aggregate per copywriter
+    cw_summary = defaultdict(lambda: {"cost": 0, "front_rev": 0, "total_rev": 0, "mc_br": 0, "vendas": 0, "count": 0})
+    for c in copy_ads:
+        d = cw_summary[c["copywriter"]]
+        d["cost"] += c["cost"]; d["front_rev"] += c["front_rev"]; d["total_rev"] += c["total_rev"]
+        d["mc_br"] += c["mc_br"]; d["vendas"] += c["vendas"]; d["count"] += 1
+
+    # Totals from campaign-level (matches dashboard)
+    ct = campaign_totals
+    # Adgroup-level totals for copy/douglas
+    d_c = sum(c["cost"] for c in douglas_ads)
+    d_f = sum(c["front_rev"] for c in douglas_ads)
+    d_t = sum(c["total_rev"] for c in douglas_ads)
+    d_m = sum(c["mc_br"] for c in douglas_ads)
+    d_v = sum(c["vendas"] for c in douglas_ads)
+    tc = sum(d["cost"] for d in cw_summary.values())
+    tf = sum(d["front_rev"] for d in cw_summary.values())
+    tt = sum(d["total_rev"] for d in cw_summary.values())
+    tm = sum(d["mc_br"] for d in cw_summary.values())
+    tv = sum(d["vendas"] for d in cw_summary.values())
+
+    # ---- PAGE 1: Resumo Executivo + Ranking ----
+    elements.append(Paragraph("Relatório Mensal — Performance Copywriters", ts))
+    elements.append(Paragraph(f"Período: {periodo}", ss))
+    elements.append(Paragraph("Desenvolvido pelo GPDR — Iago Almeida", ss))
+    elements.append(Spacer(1, 4*mm))
+
+    elements.append(Paragraph("Resumo Executivo", sec))
+    h = ["", "Custo", "Fat.Front", "ROAS Front", "MC BR", "Fat.Total", "ROAS Total", "Vendas"]
+    r = [
+        ["Global (campanha)*", fmt_v(ct["cost"]), fmt_v(ct["front_rev"]),
+         fmt_roas(ct["front_rev"]/ct["cost"] if ct["cost"] else 0), fmt_v(ct["mc_br"]),
+         fmt_v(ct["total_rev"]), fmt_roas(ct["total_rev"]/ct["cost"] if ct["cost"] else 0),
+         fmt_int(ct["vendas"])],
+        ["Douglas (rip.)", fmt_v(d_c), fmt_v(d_f), fmt_roas(d_f/d_c if d_c else 0),
+         fmt_v(d_m), fmt_v(d_t), fmt_roas(d_t/d_c if d_c else 0), fmt_int(d_v)],
+        ["Time de Copy", fmt_v(tc), fmt_v(tf), fmt_roas(tf/tc if tc else 0),
+         fmt_v(tm), fmt_v(tt), fmt_roas(tt/tc if tc else 0), fmt_int(tv)],
+    ]
+    elements.append(make_table(h, r, [30*mm, 24*mm, 24*mm, 20*mm, 24*mm, 24*mm, 20*mm, 18*mm]))
+    elements.append(Paragraph("* Campanhas YT sem breakdown por adgroup — Fraza", ns))
+    elements.append(Spacer(1, 3*mm))
+
+    elements.append(Paragraph("Ranking Copywriters — por Faturamento", sec))
+    h_r = ["#", "Copywriter", "Criativos", "Custo", "Fat.Front", "ROAS F", "MC BR", "Fat.Total", "ROAS T", "Vendas", "% Part."]
+    r_r = []
+    for rank, (cwn, d) in enumerate(sorted(cw_summary.items(), key=lambda x: x[1]["front_rev"], reverse=True), 1):
+        rf = d["front_rev"]/d["cost"] if d["cost"] else 0
+        pct = (d["front_rev"]/tf*100) if tf else 0
+        r_r.append([str(rank), cwn, str(d["count"]), fmt_v(d["cost"]), fmt_v(d["front_rev"]),
+                     fmt_roas(rf), fmt_v(d["mc_br"]), fmt_v(d["total_rev"]),
+                     fmt_roas(d["total_rev"]/d["cost"] if d["cost"] else 0), fmt_int(d["vendas"]), fmt_pct(pct)])
+    r_r.append(["", "TOTAL", str(sum(d["count"] for d in cw_summary.values())), fmt_v(tc), fmt_v(tf),
+                fmt_roas(tf/tc if tc else 0), fmt_v(tm), fmt_v(tt), fmt_roas(tt/tc if tc else 0), fmt_int(tv), "100%"])
+    t_rank = make_table(h_r, r_r, [7*mm, 20*mm, 14*mm, 22*mm, 22*mm, 14*mm, 22*mm, 22*mm, 14*mm, 14*mm, 14*mm])
+    add_total_row(t_rank, len(r_r))
+    elements.append(t_rank)
+
+    # ---- PAGES 2-3: Top 10 por Copywriter ----
+    elements.append(PageBreak())
+    elements.append(Paragraph("Top 10 Criativos por Copywriter", sec))
+    h_top = ["#", "Criativo", "Versão", "Nicho", "País", "Fat.Front", "ROAS F", "MC BR", "Vendas"]
+    cw_top = [7*mm, 22*mm, 13*mm, 12*mm, 10*mm, 22*mm, 14*mm, 22*mm, 14*mm]
+
+    cw_order = sorted(cw_summary.keys(), key=lambda x: cw_summary[x]["front_rev"], reverse=True)
+
+    for idx, cwn in enumerate(cw_order):
+        if idx == 2:
+            elements.append(PageBreak())
+        cw_cr = sorted([c for c in copy_ads if c["copywriter"] == cwn], key=lambda x: x["front_rev"], reverse=True)
+        d = cw_summary[cwn]
+        rf = d["front_rev"]/d["cost"] if d["cost"] else 0
+        elements.append(Paragraph(f"{cwn} — {d['count']} criativos | Fat. Front: {fmt_v(d['front_rev'])} | ROAS: {rf:.2f}", cwh))
+        rows_t = []
+        for i, c in enumerate(cw_cr[:10], 1):
+            rows_t.append([str(i), c["base"], c["version"], c["nicho"] or "?",
+                          c.get("mercado", "BR"),
+                          fmt_v(c["front_rev"]), fmt_roas(c["roas_front"]), fmt_v(c["mc_br"]), fmt_int(c["vendas"])])
+        elements.append(make_table(h_top, rows_t, col_widths=cw_top, font_size=7, header_size=7))
+
+    # ---- PAGE 4: Breakdowns ----
+    elements.append(PageBreak())
+    elements.append(Paragraph("Breakdowns", sec))
+
+    # -- Breakdown por Nicho --
+    elements.append(Paragraph("Breakdown por Nicho", sec_sm))
+    h_n = ["Copywriter", "Nicho", "Criat.", "Fat.Front", "ROAS F", "%Part."]
+    cw_n = [22*mm, 24*mm, 12*mm, 22*mm, 14*mm, 14*mm]
+    rows_n_all = []
+    for cwn in cw_order:
+        cw_cr = [c for c in copy_ads if c["copywriter"] == cwn]
+        nd = defaultdict(lambda: {"cost": 0, "front_rev": 0, "count": 0})
+        for c in cw_cr:
+            n = nd[c["nicho"] or "?"]; n["cost"] += c["cost"]; n["front_rev"] += c["front_rev"]; n["count"] += 1
+        cw_f = cw_summary[cwn]["front_rev"]
+        for nicho in sorted(nd.keys(), key=lambda x: nd[x]["front_rev"], reverse=True):
+            ndd = nd[nicho]
+            rf = ndd["front_rev"]/ndd["cost"] if ndd["cost"] else 0
+            pct = ndd["front_rev"]/cw_f*100 if cw_f else 0
+            rows_n_all.append([cwn, NICHO_FULL.get(nicho, nicho), str(ndd["count"]),
+                              fmt_v(ndd["front_rev"]), fmt_roas(rf), fmt_pct(pct)])
+    elements.append(make_table(h_n, rows_n_all, col_widths=cw_n, font_size=6.5, header_size=6.5, pad=1))
+
+    # -- Breakdown por Tipo --
+    elements.append(Paragraph("Breakdown por Tipo (Novo / Variação / Ripagem)", sec_sm))
+    h_t = ["Copywriter", "Tipo", "Criat.", "Fat.Front", "ROAS F", "%Part."]
+    rows_t_all = []
+    for cwn in cw_order:
+        cw_cr = [c for c in copy_ads if c["copywriter"] == cwn]
+        td = defaultdict(lambda: {"cost": 0, "front_rev": 0, "count": 0})
+        for c in cw_cr:
+            tipo = classify_tipo(c["base"], c["version"], c["nicho"])
+            t = td[tipo]; t["cost"] += c["cost"]; t["front_rev"] += c["front_rev"]; t["count"] += 1
+        cw_f = cw_summary[cwn]["front_rev"]
+        for tipo in ["Novo", "Variação", "Ripagem"]:
+            if tipo in td:
+                tdd = td[tipo]
+                rf = tdd["front_rev"]/tdd["cost"] if tdd["cost"] else 0
+                pct = tdd["front_rev"]/cw_f*100 if cw_f else 0
+                rows_t_all.append([cwn, tipo, str(tdd["count"]), fmt_v(tdd["front_rev"]), fmt_roas(rf), fmt_pct(pct)])
+    elements.append(make_table(h_t, rows_t_all, col_widths=cw_n, font_size=6.5, header_size=6.5, pad=1))
+
+    # -- Breakdown por Gestor --
+    elements.append(PageBreak())
+    elements.append(Paragraph("Breakdown por Gestor de Tráfego", sec_sm))
+    h_g = ["Copywriter", "Gestor", "Ads", "Fat.Front", "ROAS F", "%Part."]
+    rows_g_all = []
+    for cwn in cw_order:
+        cw_cr = [c for c in copy_ads if c["copywriter"] == cwn]
+        gd = defaultdict(lambda: {"cost": 0, "front_rev": 0, "count": 0})
+        for c in cw_cr:
+            g = c.get("gestor", "N/A") or "N/A"
+            gdd = gd[g]; gdd["cost"] += c["cost"]; gdd["front_rev"] += c["front_rev"]; gdd["count"] += 1
+        cw_f = cw_summary[cwn]["front_rev"]
+        for gestor in sorted(gd.keys(), key=lambda x: gd[x]["front_rev"], reverse=True):
+            gdd = gd[gestor]
+            rf = gdd["front_rev"]/gdd["cost"] if gdd["cost"] else 0
+            pct = gdd["front_rev"]/cw_f*100 if cw_f else 0
+            rows_g_all.append([cwn, gestor, str(gdd["count"]), fmt_v(gdd["front_rev"]), fmt_roas(rf), fmt_pct(pct)])
+    elements.append(make_table(h_g, rows_g_all, col_widths=cw_n, font_size=6.5, header_size=6.5, pad=1))
+
+    # ---- PAGE 5: Taxa de Assertividade ----
+    elements.append(PageBreak())
+    elements.append(Paragraph("Taxa de Assertividade", sec))
+    elements.append(Paragraph("Regras V5: CPA≤R$180, ROAS Front≥1.8 | Pré-Valid (3-9v) | Validado (10+v) | Top (30+v)", ns))
+
+    CPA_LIMIT = 180
+    ROAS_LIMIT = 1.8
+    cw_validation = defaultdict(lambda: {"total": 0, "pre_v": 0, "validado": 0, "top": 0, "em_teste": 0})
+    for c in copy_ads:
+        cwn = c["copywriter"]
+        cw_validation[cwn]["total"] += 1
+        v = c["vendas"]; cpa = c["cost"]/v if v > 0 else float("inf"); roas_f = c["roas_front"]
+        if v >= 30 and roas_f >= ROAS_LIMIT:
+            cw_validation[cwn]["top"] += 1
+        elif v >= 10 and cpa <= CPA_LIMIT and roas_f >= ROAS_LIMIT:
+            cw_validation[cwn]["validado"] += 1
+        elif v >= 3 and cpa <= CPA_LIMIT and roas_f >= ROAS_LIMIT:
+            cw_validation[cwn]["pre_v"] += 1
+        else:
+            cw_validation[cwn]["em_teste"] += 1
+
+    h_val = ["Copywriter", "Criativos", "Em Teste", "Pré-Valid.", "Validado", "Top", "Taxa Valid.", "Taxa Geral"]
+    r_val = []
+    for cwn in cw_order:
+        if cwn not in cw_validation:
+            continue
+        vd = cw_validation[cwn]
+        validated = vd["validado"] + vd["top"]
+        all_valid = vd["pre_v"] + vd["validado"] + vd["top"]
+        taxa_v = f"{validated/vd['total']*100:.0f}%" if vd["total"] else "0%"
+        taxa_g = f"{all_valid/vd['total']*100:.0f}%" if vd["total"] else "0%"
+        r_val.append([cwn, str(vd["total"]), str(vd["em_teste"]), str(vd["pre_v"]),
+                      str(vd["validado"]), str(vd["top"]), taxa_v, taxa_g])
+    # Total
+    tot = {"total": 0, "em_teste": 0, "pre_v": 0, "validado": 0, "top": 0}
+    for vd in cw_validation.values():
+        for k in tot: tot[k] += vd[k]
+    tot_v = tot["validado"] + tot["top"]
+    tot_a = tot["pre_v"] + tot["validado"] + tot["top"]
+    r_val.append(["TOTAL", str(tot["total"]), str(tot["em_teste"]), str(tot["pre_v"]),
+                  str(tot["validado"]), str(tot["top"]),
+                  f"{tot_v/tot['total']*100:.0f}%" if tot["total"] else "0%",
+                  f"{tot_a/tot['total']*100:.0f}%" if tot["total"] else "0%"])
+    cw_val_w = [22*mm, 16*mm, 16*mm, 16*mm, 16*mm, 14*mm, 18*mm, 18*mm]
+    t_val = make_table(h_val, r_val, col_widths=cw_val_w)
+    add_total_row(t_val, len(r_val))
+    elements.append(t_val)
+    elements.append(Spacer(1, 3*mm))
+    elements.append(Paragraph("Taxa Valid. = (Validado + Top) / Total | Taxa Geral = (Pré-Valid. + Validado + Top) / Total", ns))
+
+    elements.append(Spacer(1, 12*mm))
+    elements.append(Paragraph("GPDR — Iago Almeida, assistido por Claude", footer_s))
+
+    doc.build(elements)
+    print(f"PDF 1 gerado: {output_path}", flush=True)
+
+
+# ==================== PDF 2: Criativos Pai (Comissão) ====================
+
+def find_owner_for_root(root, nicho, mercado, fonte, tasks):
+    """
+    Find the ORIGINAL creator (owner) of a root creative using priority scoring.
+    Searches ClickUp tasks for the original AD (V1 or no version).
+    Uses strict matching to avoid AD1 matching AD116, AD644 matching AD644V9, etc.
+    """
+    # First check prefix-based ownership
+    prefix_owner = determine_owner_from_root(root)
+    if prefix_owner:
+        return prefix_owner
+
+    NICHO_CODES = {"DA","DB","ED","EM","ME","MM","NE","PT","ZB"}
+    FONTES = {"FB","GG","KW","MG","OB","TB","TT","YT","VTURB"}
+
+    ad_num_m = re.search(r'(\d+)$', root.upper())
+    if not ad_num_m:
+        return "SEM ATRIBUIÇÃO"
+    num = int(ad_num_m.group(1))
+
+    candidates = []
+    for t in tasks:
+        name = t.get("name", "")
+        name_upper = name.upper()
+        tcw = t.get("copywriter", "")
+        if tcw == "REAPER": tcw = "CASSIO"
+        if not tcw or tcw in ("N/A", None, ""): continue
+
+        # Detect nicho and fonte from task
+        t_nicho = None
+        t_fonte = None
+        t_mercado = None
+        for g in re.findall(r'\[([^\]]+)\]', name_upper):
+            if g in NICHO_CODES and not t_nicho: t_nicho = g
+            if g in FONTES and not t_fonte: t_fonte = g
+        if "[EUA]" in name_upper: t_mercado = "EUA"
+        elif "[BR]" in name_upper: t_mercado = "BR"
+
+        # AD match — strict: no partial numbers, no version suffixes
+        is_exact = False
+        has_ad = False
+
+        # [AD##] exact in brackets
+        if f"[AD{num}]" in name_upper.replace(" ", ""):
+            has_ad = True; is_exact = True
+
+        # Range: [AD##-AD##] includes num
+        range_m = re.search(r'\[AD(\d+)\s*[-–]\s*AD(\d+)\]', name_upper)
+        if range_m:
+            low, high = int(range_m.group(1)), int(range_m.group(2))
+            if low <= num <= high:
+                has_ad = True
+
+        # Bare: "AD63" not followed by digit or V (avoids AD644V9 matching AD644)
+        if not has_ad:
+            bare = re.search(rf'(?<!\d)AD\s*{num}(?!\d)(?!V)', name_upper)
+            if bare:
+                has_ad = True; is_exact = True
+
+        if not has_ad: continue
+
+        # Is original task? (V1 or no version bracket)
+        is_v1 = "[V1]" in name_upper or "[V1-V" in name_upper
+        has_no_v = not re.search(r'\[V\d', name_upper)
+        is_original = is_v1 or has_no_v
+
+        # Score
+        score = 0
+        if t_nicho == nicho: score += 100
+        if is_original: score += 50
+        if is_exact: score += 20
+        if t_fonte == fonte: score += 15
+        if (t_mercado == mercado) if t_mercado else True: score += 10
+        if not is_exact and has_ad: score += 5  # Range match
+
+        candidates.append((score, tcw, name[:60]))
+
+    if candidates:
+        candidates.sort(key=lambda x: -x[0])
+        return candidates[0][1]
+
+    return "SEM ATRIBUIÇÃO"
+
+
+def build_pai_data(creatives, date_from, date_to, tasks):
+    """
+    Build parent creative data for PDF 2.
+    Groups by (owner, root, nicho, mercado, fonte) — all 5 dimensions.
+    Owner = whoever CREATED the original AD.
+    """
+    # Step 1: Build root → owner mapping
+    # Collect all unique roots with their contexts
+    root_contexts = defaultdict(lambda: {"nichos": set(), "mercados": set(), "fontes": set()})
+    for c in creatives:
+        root = extract_root_base(c["base"])
+        root_contexts[root]["nichos"].add(c["nicho"])
+        root_contexts[root]["mercados"].add(c.get("mercado", "BR"))
+        root_contexts[root]["fontes"].add(c.get("fonte", "FB"))
+
+    # Step 2: For each creative, find the owner of its root and group
+    pai_agg = defaultdict(lambda: {
+        "cost": 0, "front_rev": 0, "total_rev": 0, "mc_br": 0, "vendas": 0,
+        "variations": set(), "bases": set(),
+    })
+
+    for c in creatives:
+        cw = c.get("copywriter")
+        if cw in ("SEM ATRIBUIÇÃO", "N/A", None):
+            continue
+
+        root = extract_root_base(c["base"])
+        nicho = c["nicho"]
+        mercado = c.get("mercado", "BR")
+        fonte = c.get("fonte", "FB")
+
+        # Find owner of the original root
+        owner = find_owner_for_root(root, nicho, mercado, fonte, tasks)
+        if owner == "REAPER":
+            owner = "CASSIO"
+
+        key = (owner, root, nicho, mercado, fonte)
+        p = pai_agg[key]
+        p["cost"] += c["cost"]
+        p["front_rev"] += c["front_rev"]
+        p["total_rev"] += c["total_rev"]
+        p["mc_br"] += c["mc_br"]
+        p["vendas"] += c["vendas"]
+        p["variations"].add(c.get("version", "-"))
+        p["bases"].add(c["base"])
+
+    parents = []
+    for (owner, root, nicho, mercado, fonte), p in pai_agg.items():
+        rf = p["front_rev"]/p["cost"] if p["cost"] else 0
+        rt = p["total_rev"]/p["cost"] if p["cost"] else 0
+        parents.append({
+            "owner": owner, "root": root, "nicho": nicho, "mercado": mercado, "fonte": fonte,
+            "variations": len(p["variations"]), "cost": p["cost"],
+            "front_rev": p["front_rev"], "total_rev": p["total_rev"],
+            "mc_br": p["mc_br"], "vendas": p["vendas"],
+            "roas_front": rf, "roas_total": rt,
+        })
+
+    return parents
+
+
+def generate_pdf2(parents, date_from, date_to, output_path):
+    doc = SimpleDocTemplate(output_path, pagesize=landscape(A4),
+                            leftMargin=1.2*cm, rightMargin=1.2*cm, topMargin=1.2*cm, bottomMargin=1.0*cm)
+    elements = []
+
+    df_dt = datetime.strptime(date_from, "%Y-%m-%d")
+    dt_dt = datetime.strptime(date_to, "%Y-%m-%d")
+    periodo = f"{df_dt.strftime('%d/%b/%Y')} a {dt_dt.strftime('%d/%b/%Y')}"
+
+    # ---- PAGE 1: Ranking per Owner ----
+    elements.append(Paragraph("Relatório Mensal — Criativos Pai (Comissão)", ts))
+    elements.append(Paragraph(f"Período: {periodo}", ss))
+    elements.append(Paragraph("Desenvolvido pelo GPDR — Iago Almeida", ss))
+    elements.append(Paragraph("Atribuição: todo faturamento vai para o criador do AD original", ns))
+    elements.append(Spacer(1, 4*mm))
+
+    # Aggregate per owner
+    owner_summary = defaultdict(lambda: {
+        "cost": 0, "front_rev": 0, "total_rev": 0, "mc_br": 0, "vendas": 0,
+        "parents": 0, "total_vars": 0,
+    })
+    for p in parents:
+        d = owner_summary[p["owner"]]
+        d["cost"] += p["cost"]; d["front_rev"] += p["front_rev"]; d["total_rev"] += p["total_rev"]
+        d["mc_br"] += p["mc_br"]; d["vendas"] += p["vendas"]; d["parents"] += 1
+        d["total_vars"] += p["variations"]
+
+    elements.append(Paragraph("Ranking por Owner (Criativo Pai)", sec))
+
+    # Separate COPY_TEAM and Douglas
+    copy_owners = {k: v for k, v in owner_summary.items() if k in COPY_TEAM}
+    douglas_data = owner_summary.get("DOUGLAS*")
+    other_owners = {k: v for k, v in owner_summary.items() if k not in COPY_TEAM and k != "DOUGLAS*"}
+
+    h_p = ["#", "Owner", "Pais", "Vars", "Custo", "Fat.Front", "ROAS F", "MC BR", "Fat.Total", "ROAS T", "Vendas"]
+    r_p = []
+    total_f = sum(d["front_rev"] for d in owner_summary.values())
+
+    rank = 1
+    for cwn, d in sorted(copy_owners.items(), key=lambda x: x[1]["front_rev"], reverse=True):
+        rf = d["front_rev"]/d["cost"] if d["cost"] else 0
+        r_p.append([str(rank), cwn, str(d["parents"]), str(d["total_vars"]),
+                    fmt_v(d["cost"]), fmt_v(d["front_rev"]), fmt_roas(rf),
+                    fmt_v(d["mc_br"]), fmt_v(d["total_rev"]),
+                    fmt_roas(d["total_rev"]/d["cost"] if d["cost"] else 0), fmt_int(d["vendas"])])
+        rank += 1
+
+    # Douglas as reference (no commission)
+    if douglas_data:
+        d = douglas_data
+        rf = d["front_rev"]/d["cost"] if d["cost"] else 0
+        r_p.append(["ref", "DOUGLAS*", str(d["parents"]), str(d["total_vars"]),
+                    fmt_v(d["cost"]), fmt_v(d["front_rev"]), fmt_roas(rf),
+                    fmt_v(d["mc_br"]), fmt_v(d["total_rev"]),
+                    fmt_roas(d["total_rev"]/d["cost"] if d["cost"] else 0), fmt_int(d["vendas"])])
+
+    # Other unattributed
+    for cwn, d in sorted(other_owners.items(), key=lambda x: x[1]["front_rev"], reverse=True):
+        rf = d["front_rev"]/d["cost"] if d["cost"] else 0
+        r_p.append(["-", cwn, str(d["parents"]), str(d["total_vars"]),
+                    fmt_v(d["cost"]), fmt_v(d["front_rev"]), fmt_roas(rf),
+                    fmt_v(d["mc_br"]), fmt_v(d["total_rev"]),
+                    fmt_roas(d["total_rev"]/d["cost"] if d["cost"] else 0), fmt_int(d["vendas"])])
+
+    # Total row
+    tc = sum(d["cost"] for d in owner_summary.values())
+    tf_t = sum(d["front_rev"] for d in owner_summary.values())
+    tt = sum(d["total_rev"] for d in owner_summary.values())
+    tm = sum(d["mc_br"] for d in owner_summary.values())
+    tv = sum(d["vendas"] for d in owner_summary.values())
+    tp = sum(d["parents"] for d in owner_summary.values())
+    tvars = sum(d["total_vars"] for d in owner_summary.values())
+    r_p.append(["", "TOTAL", str(tp), str(tvars),
+                fmt_v(tc), fmt_v(tf_t), fmt_roas(tf_t/tc if tc else 0),
+                fmt_v(tm), fmt_v(tt), fmt_roas(tt/tc if tc else 0), fmt_int(tv)])
+
+    cw_p = [7*mm, 20*mm, 12*mm, 12*mm, 22*mm, 22*mm, 14*mm, 22*mm, 22*mm, 14*mm, 14*mm]
+    t_p = make_table(h_p, r_p, col_widths=cw_p)
+    add_total_row(t_p, len(r_p))
+    elements.append(t_p)
+    elements.append(Spacer(1, 3*mm))
+    elements.append(Paragraph("* Douglas aparece como referência — sem comissão. C## = Douglas (ripagem sem autoria copy).", ns))
+
+    # ---- PAGES 2+: Top 10 per Owner (COPY_TEAM only) ----
+    elements.append(PageBreak())
+    elements.append(Paragraph("Top 10 Criativos Pai por Owner", sec))
+    h_cp = ["#", "Criativo", "Nicho", "País", "Fonte", "Vars", "Fat.Front", "ROAS F", "Fat.Total", "Vendas"]
+    cw_cp = [7*mm, 20*mm, 14*mm, 10*mm, 10*mm, 12*mm, 22*mm, 14*mm, 22*mm, 14*mm]
+
+    owner_order = sorted(copy_owners.keys(), key=lambda x: copy_owners[x]["front_rev"], reverse=True)
+    for idx, cwn in enumerate(owner_order):
+        if idx > 0 and idx % 2 == 0:
+            elements.append(PageBreak())
+        cw_parents = sorted([p for p in parents if p["owner"] == cwn], key=lambda x: x["front_rev"], reverse=True)
+        d = copy_owners[cwn]
+        rf = d["front_rev"]/d["cost"] if d["cost"] else 0
+        elements.append(Paragraph(f"{cwn} — {d['parents']} pais | Fat. Front: {fmt_v(d['front_rev'])} | ROAS: {rf:.2f}", cwh))
+        rows_cp = []
+        for i, p in enumerate(cw_parents[:10], 1):
+            rows_cp.append([str(i), p["root"], p["nicho"] or "?", p["mercado"], p["fonte"],
+                           str(p["variations"]),
+                           fmt_v(p["front_rev"]), fmt_roas(p["roas_front"]),
+                           fmt_v(p["total_rev"]), fmt_int(p["vendas"])])
+        elements.append(make_table(h_cp, rows_cp, col_widths=cw_cp, font_size=7, header_size=7))
+
+    elements.append(Spacer(1, 12*mm))
+    elements.append(Paragraph("GPDR — Iago Almeida, assistido por Claude", footer_s))
+
+    doc.build(elements)
+    print(f"PDF 2 gerado: {output_path}", flush=True)
+
+
+# ==================== Main ====================
+
+if __name__ == "__main__":
+    now = datetime.now()
+
+    # Parse --periodo DD/MM DD/MM
+    if "--periodo" in sys.argv:
+        idx = sys.argv.index("--periodo")
+        p1 = sys.argv[idx + 1].split("/")
+        p2 = sys.argv[idx + 2].split("/")
+        year = now.year
+        if len(p1) == 3:
+            year = int(p1[2])
+        date_from = f"{year}-{int(p1[1]):02d}-{int(p1[0]):02d}"
+        date_to = f"{year}-{int(p2[1]):02d}-{int(p2[0]):02d}"
+    elif len(sys.argv) >= 3 and "/" in sys.argv[1]:
+        p1 = sys.argv[1].split("/")
+        p2 = sys.argv[2].split("/")
+        year = now.year
+        date_from = f"{year}-{int(p1[1]):02d}-{int(p1[0]):02d}"
+        date_to = f"{year}-{int(p2[1]):02d}-{int(p2[0]):02d}"
+    else:
+        # Previous month
+        last_month = now.replace(day=1) - timedelta(days=1)
+        date_from = last_month.replace(day=1).strftime("%Y-%m-%d")
+        date_to = last_month.strftime("%Y-%m-%d")
+
+    df_dt = datetime.strptime(date_from, "%Y-%m-%d")
+    dt_dt = datetime.strptime(date_to, "%Y-%m-%d")
+    # Portuguese month abbreviations for filenames
+    PT_MONTHS = {1: "Jan", 2: "Fev", 3: "Mar", 4: "Abr", 5: "Mai", 6: "Jun",
+                 7: "Jul", 8: "Ago", 9: "Set", 10: "Out", 11: "Nov", 12: "Dez"}
+    month_label = f"{PT_MONTHS.get(df_dt.month, df_dt.strftime('%b'))}{df_dt.year}"
+
+    print(f"Período: {date_from} a {date_to}", flush=True)
+    print("=" * 60, flush=True)
+
+    # Collect data (PDF 1 — attribution by who MADE the variation)
+    print("Coletando dados (atribuição por variação)...", flush=True)
+    creatives = collect_data(date_from, date_to)
+    print(f"Total criativos: {len(creatives)}", flush=True)
+
+    # Enrich with gestor, mercado, fonte info
+    print("Enriquecendo com info de gestor/mercado/fonte...", flush=True)
+    enrich_creatives_with_extra(creatives, date_from, date_to)
+
+    # Fetch campaign-level totals for resumo executivo
+    print("Buscando totais por campanha (dashboard)...", flush=True)
+    campaign_totals = fetch_campaign_totals(date_from, date_to)
+
+    # Load ClickUp tasks for owner resolution (PDF 2)
+    print("Carregando tarefas ClickUp para resolução de owner...", flush=True)
+    copy_raw = cached_cu_tasks(COPY_LIST, include_closed=True, ttl=1800)
+    traf_raw = cached_cu_tasks(TRAFEGO_LIST, include_closed=False, ttl=1800)
+    tasks = [parse_cu_task(t) for t in copy_raw + traf_raw if re.match(r"\s*\[", t["name"])]
+    print(f"  {len(tasks)} tarefas carregadas", flush=True)
+
+    # Build parent data (PDF 2 — attribution by who CREATED the original)
+    print("Construindo dados de criativos pai (comissão)...", flush=True)
+    parents = build_pai_data(creatives, date_from, date_to, tasks)
+    print(f"  {len(parents)} criativos pai agrupados", flush=True)
+
+    # Generate PDFs
+    out_dir = os.path.expanduser("~/Documents")
+    pdf1 = os.path.join(out_dir, f"Relatorio_Performance_Copywriters_{month_label}.pdf")
+    pdf2 = os.path.join(out_dir, f"Relatorio_Criativos_Pai_Comissao_{month_label}.pdf")
+
+    generate_pdf1(creatives, date_from, date_to, pdf1, campaign_totals)
+    generate_pdf2(parents, date_from, date_to, pdf2)
+
+    # Print file sizes
+    for path in [pdf1, pdf2]:
+        size = os.path.getsize(path)
+        if size > 1024 * 1024:
+            print(f"  {os.path.basename(path)}: {size / 1024 / 1024:.1f} MB")
+        else:
+            print(f"  {os.path.basename(path)}: {size / 1024:.0f} KB")
+
+    print(f"\nConcluído! Ambos PDFs em ~/Documents/", flush=True)

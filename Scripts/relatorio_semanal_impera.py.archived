@@ -1,0 +1,554 @@
+#!/usr/bin/env python3
+"""
+Relatório Semanal de Produção — IMPERA PRODUTOS NATURAIS
+Gera automaticamente via crontab todo domingo às 12h.
+Busca dados do ClickUp API e gera .docx em ~/Documents/
+"""
+
+import json
+import os
+import re
+import subprocess
+import urllib.request
+import sys
+from collections import defaultdict
+from datetime import datetime, timedelta
+
+sys.path.insert(0, os.path.expanduser("~/Scripts"))
+from impera_utils import normalize_person_name
+
+# === CONFIG ===
+API_TOKEN = os.environ.get("CLICKUP_API_TOKEN", "")
+LIST_COPY = "901324556390"
+# Lista unificada — EDIÇÃO agora na COPY
+OUTPUT_DIR = os.path.expanduser("~/Documents")
+
+NICHOS = {
+    "DA": "Dores Articulares", "DB": "Diabetes", "ED": "Adulto / ED",
+    "EM": "Emagrecimento", "MM": "Memória", "NE": "Neuropatia",
+    "PT": "Próstata", "ZB": "Zumbido", "ME": "Memória EUA",
+}
+CATS = ["img_novo", "img_otim", "vid_novo", "vid_otim", "lead", "microlead", "vsl", "rp"]
+CAT_LABELS = ["Img Nov", "Img Otim", "Víd Nov", "Víd Otim", "Leads", "MLD", "VSL", "RP"]
+
+EDITOR_STATUSES_COPY = ["avaliação - pós edição", "avaliação - pós alteração", "enviado para trafego"]
+EDITOR_STATUSES_EDICAO = ["em edição", "em alteração", "avaliação - pós edição", "avaliação - pós alteração"]
+EDITOR_EXCLUIR_EDICAO = ["backlog", "backlog edição", "pré produção", "pre produção finalizada"]
+
+
+def api_get(endpoint):
+    url = f"https://api.clickup.com/api/v2{endpoint}"
+    req = urllib.request.Request(url, headers={"Authorization": API_TOKEN})
+    with urllib.request.urlopen(req) as resp:
+        return json.loads(resp.read())
+
+
+def fetch_all_tasks(list_id, statuses=None, include_closed=True):
+    tasks = []
+    page = 0
+    while True:
+        params = f"subtasks=true&include_closed={'true' if include_closed else 'false'}&page={page}"
+        if statuses:
+            for s in statuses:
+                params += f"&statuses%5B%5D={urllib.request.quote(s)}"
+        data = api_get(f"/list/{list_id}/task?{params}")
+        batch = data.get("tasks", [])
+        tasks.extend(batch)
+        if data.get("last_page", True) or not batch:
+            break
+        page += 1
+    return tasks
+
+
+def extract_ad_range(text):
+    # Full format: [AD196- AD200] or [AD01 ao AD50]
+    for p in [r"AD\s*(\d+)\s*(?:ao|-)\s*AD\s*(\d+)", r"AD(\d+)\s*-\s*AD(\d+)"]:
+        m = re.search(p, text, re.IGNORECASE)
+        if m:
+            return int(m.group(1)), int(m.group(2))
+    # Short format: [AD11-15] (without second AD)
+    m = re.search(r"\[AD(\d+)\s*-\s*(\d+)\]", text)
+    if m:
+        return int(m.group(1)), int(m.group(2))
+    # CY format (ripados): [CY01-CY08] or [CY01-08]
+    m = re.search(r"CY(\d+)\s*-\s*(?:CY)?(\d+)", text)
+    if m:
+        return int(m.group(1)), int(m.group(2))
+    return None, None
+
+
+def extract_ld_mld_range(text):
+    # MLD: MLD01-05, MLD 01-05, MLD04 A 13
+    m = re.search(r"MLD\s*(\d+)\s*[-aA]\s*(?:MLD)?\s*(\d+)", text)
+    if m:
+        return "Microlead", int(m.group(1)), int(m.group(2))
+    # LD: LD01-05, LD01 A LD03, LD01 a 03
+    m = re.search(r"(?<!\w)LD\s*(\d+)\s*[-aA]\s*(?:LD)?\s*(\d+)", text, re.IGNORECASE)
+    if m:
+        return "Lead", int(m.group(1)), int(m.group(2))
+    return None, None, None
+
+
+def extract_version_range(text):
+    m = re.search(r"\[V(\d+)\s*-\s*V?(\d+)\]", text)
+    if m:
+        return int(m.group(1)), int(m.group(2))
+    m = re.search(r"\[V(\d+)\]", text)
+    if m:
+        return int(m.group(1)), int(m.group(1))
+    return None, None
+
+
+def get_cf(task, field_name):
+    for cf in task.get("custom_fields", []):
+        if field_name.lower() in cf.get("name", "").lower():
+            opts = cf.get("type_config", {}).get("options", [])
+            val = cf.get("value")
+            if val is not None:
+                for o in opts:
+                    if o.get("orderindex") == val:
+                        return normalize_person_name(o["name"]) or "NÃO ATRIBUÍDO"
+    return "NÃO ATRIBUÍDO"
+
+
+def classify(task):
+    name = task["name"]
+    info = {"name": name, "status": task["status"]["status"]}
+
+    # Nicho: primeiro grupo de 2 letras que seja nicho válido (ignora RP, BR, EUA)
+    NICHOS_VALIDOS = {"DA", "DB", "ED", "EM", "ME", "MM", "NE", "PT", "ZB"}
+    nicho = "??"
+    for nm in re.findall(r"\[([A-Z]{2,3})\]", name):
+        if nm in NICHOS_VALIDOS:
+            nicho = nm
+            break
+    info["nicho"] = nicho
+
+    sd = task.get("start_date")
+    info["start_date"] = datetime.fromtimestamp(int(sd) / 1000) if sd else None
+
+    # Ripado e Mercado
+    upper = name.upper()
+    info["is_rp"] = "[RP]" in upper or "RIPAGEM" in upper
+    info["mercado"] = "EUA" if "[EUA]" in upper else "BR"
+
+    # Se é ripado → categoria "rp" (conta na coluna RP, não mistura com produção original)
+    if info["is_rp"]:
+        ad_low, ad_high = extract_ad_range(name)
+        if ad_low is not None:
+            info["qtd"] = ad_high - ad_low + 1
+        else:
+            info["qtd"] = 1
+        info["categoria"] = "rp"
+    else:
+        ld_type, ld_low, ld_high = extract_ld_mld_range(name)
+        if ld_type:
+            info["categoria"] = "lead" if ld_type == "Lead" else "microlead"
+            info["qtd"] = ld_high - ld_low + 1
+        else:
+            is_img = "IMG" in name.upper()
+            v_low, v_high = extract_version_range(name)
+            ad_low, ad_high = extract_ad_range(name)
+            has_v1 = v_low == 1 if v_low is not None else False
+
+            # Detectar VSL: tarefas que são VSL puras (sem AD range, sem V range significativo)
+            upper = name.upper()
+            is_vsl = "VSL" in upper and ad_low is None and v_low is None
+
+            if is_vsl:
+                info["categoria"] = "vsl"
+                info["qtd"] = 1
+            elif is_img and has_v1:
+                info["categoria"] = "img_novo"
+                v_count = (v_high - v_low + 1) if v_low is not None and v_high is not None else 1
+                if ad_low is not None:
+                    info["qtd"] = (ad_high - ad_low + 1) * v_count
+                elif v_low is not None:
+                    info["qtd"] = v_count
+                else:
+                    info["qtd"] = 1
+            elif is_img:
+                info["categoria"] = "img_otim"
+                v_count = (v_high - v_low + 1) if v_low is not None and v_high is not None else 1
+                if ad_low is not None:
+                    info["qtd"] = (ad_high - ad_low + 1) * v_count
+                elif v_low is not None:
+                    info["qtd"] = v_count
+                else:
+                    info["qtd"] = 1
+            elif has_v1:
+                info["categoria"] = "vid_novo"
+                v_count = (v_high - v_low + 1) if v_low is not None and v_high is not None else 1
+                if ad_low is not None:
+                    info["qtd"] = (ad_high - ad_low + 1) * v_count
+                elif v_low is not None:
+                    info["qtd"] = v_count
+                else:
+                    info["qtd"] = 1
+            else:
+                info["categoria"] = "vid_otim"
+                v_count = (v_high - v_low + 1) if v_low is not None and v_high is not None else 1
+                if ad_low is not None:
+                    info["qtd"] = (ad_high - ad_low + 1) * v_count
+                elif v_low is not None:
+                    info["qtd"] = v_count
+                else:
+                    info["qtd"] = 1
+
+    info["copywriter"] = get_cf(task, "Copywritter")
+    info["editor"] = get_cf(task, "Editor de Video")
+    return info
+
+
+def get_copy_range():
+    """Copywriters: últimos 9 dias antes do disparo."""
+    today = datetime.now()
+    start = (today - timedelta(days=9)).replace(hour=0, minute=0, second=0, microsecond=0)
+    end = (today - timedelta(days=1)).replace(hour=23, minute=59, second=59, microsecond=0)
+    return start, end
+
+
+def get_editor_range():
+    """Editores: últimos 7 dias antes do disparo (segunda a domingo)."""
+    today = datetime.now()
+    start = (today - timedelta(days=7)).replace(hour=0, minute=0, second=0, microsecond=0)
+    end = (today - timedelta(days=1)).replace(hour=23, minute=59, second=59, microsecond=0)
+    return start, end
+
+
+def build_docx(cw_weekly, ed_snapshot, cw_trafego, ed_trafego, nicho_cw, nicho_ed, copy_start, copy_end,
+               prev_cw_weekly=None, prev_ed_snapshot=None, prev_cw_trafego=None, **kwargs):
+    from docx import Document
+    from docx.shared import Pt, RGBColor
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.enum.table import WD_TABLE_ALIGNMENT
+
+    doc = Document()
+    style = doc.styles["Normal"]
+    style.font.name = "Calibri"
+    style.font.size = Pt(10)
+
+    cs = copy_start.strftime("%d.%m")
+    ce = copy_end.strftime("%d.%m")
+    ed_s = (datetime.now() - timedelta(days=7)).strftime("%d.%m")
+    ed_e = (datetime.now() - timedelta(days=1)).strftime("%d.%m")
+
+    def add_table(doc, title, stats, label_col="Nome"):
+        doc.add_heading(title, level=2)
+        headers = [label_col, "Total"] + list(CAT_LABELS)
+        rows = []
+        for name in sorted(stats.keys()):
+            s = stats[name]
+            total = sum(s[c] for c in CATS)
+            rows.append([name, total] + [s[c] for c in CATS])
+        grand = sum(r[1] for r in rows)
+        gt = [sum(stats[n][c] for n in stats) for c in CATS]
+        rows.append(["TOTAL", grand] + gt)
+
+        table = doc.add_table(rows=1 + len(rows), cols=len(headers))
+        table.style = "Light Grid Accent 1"
+        table.alignment = WD_TABLE_ALIGNMENT.CENTER
+        for i, h in enumerate(headers):
+            cell = table.rows[0].cells[i]
+            cell.text = h
+            for p in cell.paragraphs:
+                p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                for run in p.runs:
+                    run.bold = True
+                    run.font.size = Pt(9)
+        for ri, row in enumerate(rows):
+            for ci, val in enumerate(row):
+                cell = table.rows[ri + 1].cells[ci]
+                cell.text = str(val)
+                for p in cell.paragraphs:
+                    p.alignment = WD_ALIGN_PARAGRAPH.CENTER if ci > 0 else WD_ALIGN_PARAGRAPH.LEFT
+                    for run in p.runs:
+                        run.font.size = Pt(9)
+                        if ri == len(rows) - 1:
+                            run.bold = True
+        doc.add_paragraph("")
+
+    # === RESUMO COMPARATIVO ===
+    t = doc.add_heading(f"Relatório de Produção — Enviado para Tráfego", level=1)
+    t.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    doc.add_paragraph(f"Gerado automaticamente em {datetime.now().strftime('%d/%m/%Y %H:%M')}")
+
+    # Summary box comparing with previous week
+    total_cw = sum(sum(cw_trafego[n][c] for c in CATS) for n in cw_trafego)
+    total_ed = sum(sum(ed_trafego[n][c] for c in CATS) for n in ed_trafego)
+    total_cw_sem = sum(sum(cw_weekly[n][c] for c in CATS) for n in cw_weekly)
+    total_ed_sem = sum(sum(ed_snapshot[n][c] for c in CATS) for n in ed_snapshot)
+
+    if prev_cw_trafego or prev_cw_weekly or prev_ed_snapshot:
+        doc.add_heading("Resumo da Semana vs Semana Anterior", level=2)
+        prev_cw_t = sum(sum(prev_cw_trafego[n][c] for c in CATS) for n in prev_cw_trafego) if prev_cw_trafego else 0
+        prev_cw_s = sum(sum(prev_cw_weekly[n][c] for c in CATS) for n in prev_cw_weekly) if prev_cw_weekly else 0
+        prev_ed_s = sum(sum(prev_ed_snapshot[n][c] for c in CATS) for n in prev_ed_snapshot) if prev_ed_snapshot else 0
+
+        headers_r = ["Métrica", "Esta Semana", "Semana Anterior", "Δ"]
+        comparisons = [
+            ("Copy — Produção Total", total_cw_sem, prev_cw_s),
+            ("Copy — Enviado Tráfego", total_cw, prev_cw_t),
+            ("Edição — Snapshot", total_ed_sem, prev_ed_s),
+        ]
+        rtable = doc.add_table(rows=1+len(comparisons), cols=4)
+        rtable.style = "Light Grid Accent 1"
+        rtable.alignment = WD_TABLE_ALIGNMENT.CENTER
+        for i, h in enumerate(headers_r):
+            rtable.rows[0].cells[i].text = h
+            for p in rtable.rows[0].cells[i].paragraphs:
+                p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                for r in p.runs: r.bold = True; r.font.size = Pt(9)
+        for ri, (label, curr, prev) in enumerate(comparisons):
+            diff = curr - prev
+            arrow = "⬆️" if diff > 0 else ("⬇️" if diff < 0 else "➡️")
+            pct = f" ({diff/prev*100:+.0f}%)" if prev > 0 else ""
+            row_data = [label, str(curr), str(prev), f"{arrow} {diff:+}{pct}"]
+            for ci, val in enumerate(row_data):
+                rtable.rows[ri+1].cells[ci].text = val
+                for p in rtable.rows[ri+1].cells[ci].paragraphs:
+                    p.alignment = WD_ALIGN_PARAGRAPH.CENTER if ci > 0 else WD_ALIGN_PARAGRAPH.LEFT
+                    for r in p.runs:
+                        r.font.size = Pt(9)
+                        if ci == 3:
+                            if diff > 0: r.font.color.rgb = RGBColor(0x10, 0xa5, 0x6c)
+                            elif diff < 0: r.font.color.rgb = RGBColor(0xe5, 0x48, 0x4d)
+        doc.add_paragraph("")
+
+    # === Produção enviada ao tráfego ===
+    add_table(doc, "Produção enviada ao tráfego na semana — Copywriter", cw_trafego, "Copywriter")
+    add_table(doc, "Produção enviada ao tráfego na semana — Editor de Vídeo", ed_trafego, "Editor")
+
+    # Consolidação
+    doc.add_heading("Consolidação Geral", level=2)
+    total_stats = {c: sum(cw_trafego[n][c] for n in cw_trafego) for c in CATS}
+    table = doc.add_table(rows=len(CATS) + 2, cols=2)
+    table.style = "Light Grid Accent 1"
+    table.rows[0].cells[0].text = "Tipo"
+    table.rows[0].cells[1].text = "Total"
+    for p in table.rows[0].cells[0].paragraphs:
+        for run in p.runs:
+            run.bold = True
+    for p in table.rows[0].cells[1].paragraphs:
+        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        for run in p.runs:
+            run.bold = True
+    for i, (c, label) in enumerate(zip(CATS, CAT_LABELS)):
+        table.rows[i + 1].cells[0].text = label
+        table.rows[i + 1].cells[1].text = str(total_stats[c])
+        for p in table.rows[i + 1].cells[1].paragraphs:
+            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    last = len(CATS) + 1
+    table.rows[last].cells[0].text = "TOTAL GERAL"
+    table.rows[last].cells[1].text = str(sum(total_stats.values()))
+    for p in table.rows[last].cells[0].paragraphs:
+        for run in p.runs:
+            run.bold = True
+    for p in table.rows[last].cells[1].paragraphs:
+        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        for run in p.runs:
+            run.bold = True
+
+    doc.add_paragraph("")
+
+    # Nicho
+    doc.add_heading("Produção por Nicho", level=2)
+    table = doc.add_table(rows=len(nicho_cw) + 2, cols=2)
+    table.style = "Light Grid Accent 1"
+    table.rows[0].cells[0].text = "Nicho"
+    table.rows[0].cells[1].text = "Total"
+    for p in table.rows[0].cells[0].paragraphs:
+        for run in p.runs:
+            run.bold = True
+    for p in table.rows[0].cells[1].paragraphs:
+        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        for run in p.runs:
+            run.bold = True
+    for i, sigla in enumerate(sorted(nicho_cw.keys())):
+        label = NICHOS.get(sigla, sigla)
+        table.rows[i + 1].cells[0].text = f"{sigla} ({label})"
+        table.rows[i + 1].cells[1].text = str(nicho_cw[sigla])
+        for p in table.rows[i + 1].cells[1].paragraphs:
+            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    last = len(nicho_cw) + 1
+    table.rows[last].cells[0].text = "TOTAL GERAL"
+    table.rows[last].cells[1].text = str(sum(nicho_cw.values()))
+    for p in table.rows[last].cells[0].paragraphs:
+        for run in p.runs:
+            run.bold = True
+    for p in table.rows[last].cells[1].paragraphs:
+        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        for run in p.runs:
+            run.bold = True
+
+    # === PAGE BREAK ===
+    doc.add_page_break()
+
+    # === PAGE BREAK ===
+    doc.add_page_break()
+
+    # === RELATÓRIO 2: Produção Total da Semana ===
+    t2 = doc.add_heading("Produção Total da Semana (por data de criação)", level=1)
+    t2.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+    add_table(doc, f"Produção Copywriters [{cs} a {ce}] (9 dias)", cw_weekly, "Copywriter")
+    add_table(doc, f"Produção Editores de Vídeo [{ed_s} a {ed_e}] (snapshot)", ed_snapshot, "Editor")
+
+    # === PAGE BREAK ===
+    doc.add_page_break()
+
+    # === GLOSSÁRIO ===
+    doc.add_heading("Glossário", level=2)
+
+    glossario = [
+        ("Produção enviada ao tráfego", "Tarefas que estão atualmente no status 'enviado para trafego' na lista COPY. Representa o que já foi finalizado e liberado para o time de tráfego testar."),
+        ("Produção Total da Semana", "Todas as tarefas criadas no período (por data de criação), independente do status atual. Mostra o volume real de trabalho da semana, incluindo o que ainda está em produção."),
+        ("Snapshot (Edição)", "Tarefas que estão ATUALMENTE nos status de produção do editor (avaliação pós-edição, avaliação pós-alteração, enviado para tráfego, produção de alteração). Reseta toda segunda-feira."),
+        ("Img Nov", "Criativos de imagem novos (contém [V1] e IMG no nome)."),
+        ("Img Otim", "Variações/otimizações de imagem (contém IMG mas não começa em V1)."),
+        ("Víd Nov", "Criativos de vídeo novos (contém [V1], sem IMG)."),
+        ("Víd Otim", "Variações/otimizações de vídeo (sem V1, sem IMG)."),
+        ("Leads", "Página de lead para funil. Identificado por LD na nomenclatura. Separador aceito: - ou A."),
+        ("MLD", "Micro página de lead. Identificado por MLD na nomenclatura."),
+        ("VSL", "Video Sales Letter completa. Tarefas com 'VSL' no nome sem AD range."),
+        ("RP", "Conteúdo ripado (concorrente). Identificado por [RP] ou 'RIPAGEM'. Produzido pelo copywriter, não passa pela edição. Aparece como coluna RP na tabela."),
+        ("Contagem", "Inclusiva: [AD75-AD80] = 6 criativos (80-75+1). Quando tem AD + Versão, multiplica: [AD34-AD38][V1-V2] = 5×2 = 10."),
+        ("[BR] / [EUA]", "Marcador de mercado. Usado quando um nicho opera em ambos os mercados (atualmente só Memória)."),
+        ("Semana Anterior", "O comparativo usa o mesmo período da semana anterior para medir evolução."),
+    ]
+
+    for termo, desc in glossario:
+        p = doc.add_paragraph()
+        r = p.add_run(f"{termo}: ")
+        r.bold = True
+        r.font.size = Pt(9)
+        r2 = p.add_run(desc)
+        r2.font.size = Pt(9)
+
+    # === ASSINATURA ===
+    doc.add_paragraph("")
+    doc.add_paragraph("")
+    p = doc.add_paragraph()
+    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    r = p.add_run("GPDR — Iago Almeida")
+    r.bold = True
+    r.font.size = Pt(11)
+    p2 = doc.add_paragraph()
+    p2.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    r2 = p2.add_run(f"Grupo Impera | {datetime.now().strftime('%d/%m/%Y')}")
+    r2.font.size = Pt(9)
+    r2.font.color.rgb = RGBColor(0x94, 0xa3, 0xb8)
+
+    return doc
+
+
+def main():
+    if not API_TOKEN:
+        print("ERRO: CLICKUP_API_TOKEN não configurado")
+        return
+
+    print("Buscando dados do ClickUp...")
+
+    # Fetch all tasks (lista unificada)
+    all_copy = fetch_all_tasks(LIST_COPY)
+    print(f"  COPY: {len(all_copy)} tarefas")
+
+    # Classify all
+    copy_classified = [classify(t) for t in all_copy]
+
+    # Date ranges
+    copy_start, copy_end = get_copy_range()    # 9 dias antes do disparo
+    ed_start, ed_end = get_editor_range()      # 7 dias antes do disparo
+    print(f"  Período Copy:    {copy_start.strftime('%d/%m')} a {copy_end.strftime('%d/%m')} (9 dias)")
+    print(f"  Período Edição:  {ed_start.strftime('%d/%m')} a {ed_end.strftime('%d/%m')} (7 dias)")
+
+    def make_stats():
+        return {c: 0 for c in CATS}
+
+    # === RELATÓRIO 1: Enviado para Tráfego (RP como coluna, não seção separada) ===
+    cw_trafego = defaultdict(make_stats)
+    ed_trafego = defaultdict(make_stats)
+    nicho_trafego = defaultdict(int)
+
+    for r in copy_classified:
+        if r["status"] == "enviado para trafego":
+            cw_trafego[r["copywriter"]][r["categoria"]] += r["qtd"]
+            # Editor só conta produção não-ripada
+            if not r.get("is_rp", False):
+                ed_trafego[r["editor"]][r["categoria"]] += r["qtd"]
+            nicho_trafego[r["nicho"]] += r["qtd"]
+
+    # === RELATÓRIO 2: Semanal (RP como coluna) ===
+    cw_weekly = defaultdict(make_stats)
+    for r in copy_classified:
+        sd = r.get("start_date")
+        if sd and copy_start <= sd <= copy_end:
+            cw_weekly[r["copywriter"]][r["categoria"]] += r["qtd"]
+
+    # Editores: snapshot por status (sem filtro de data)
+    ed_snapshot = defaultdict(make_stats)
+
+    for r in copy_classified:
+        if r["status"] in EDITOR_STATUSES_COPY:
+            if not r.get("is_rp", False):
+                ed_snapshot[r["editor"]][r["categoria"]] += r["qtd"]
+
+    # === SEMANA ANTERIOR (para comparativo) ===
+    prev_copy_start = copy_start - timedelta(days=7)
+    prev_copy_end = copy_end - timedelta(days=7)
+
+    prev_cw_weekly = defaultdict(make_stats)
+    prev_cw_trafego = defaultdict(make_stats)
+    prev_ed_snapshot_data = defaultdict(make_stats)
+
+    for r in copy_classified:
+        sd = r.get("start_date")
+        if sd and prev_copy_start <= sd <= prev_copy_end:
+            if not r.get("is_rp", False):
+                prev_cw_weekly[r["copywriter"]][r["categoria"]] += r["qtd"]
+
+    for r in copy_classified:
+        if r["status"] == "enviado para trafego":
+            dc = r.get("start_date")
+            if dc and prev_copy_start <= dc <= prev_copy_end:
+                if not r.get("is_rp", False):
+                    prev_cw_trafego[r["copywriter"]][r["categoria"]] += r["qtd"]
+                    prev_ed_snapshot_data[r["editor"]][r["categoria"]] += r["qtd"]
+
+    print(f"  Semana anterior: {prev_copy_start.strftime('%d/%m')} a {prev_copy_end.strftime('%d/%m')}")
+
+    # Build docx
+    print("Gerando relatório .docx...")
+    doc = build_docx(
+        cw_weekly, ed_snapshot, cw_trafego, ed_trafego,
+        nicho_trafego, {}, copy_start, copy_end,
+        prev_cw_weekly=prev_cw_weekly, prev_ed_snapshot=prev_ed_snapshot_data,
+        prev_cw_trafego=prev_cw_trafego,
+    )
+
+    today_str = datetime.now().strftime("%d%m")
+    output_path = os.path.join(OUTPUT_DIR, f"Relatorio_Semanal_Producao_{today_str}.docx")
+    try:
+        doc.save(output_path)
+    except PermissionError:
+        ts = datetime.now().strftime("%H%M%S")
+        output_path = os.path.join(OUTPUT_DIR, f"Relatorio_Semanal_Producao_{today_str}_{ts}.docx")
+        doc.save(output_path)
+        print(f"⚠️ Arquivo original em uso, salvo como alternativo: {output_path}")
+    print(f"Relatório salvo: {output_path}")
+
+    # Open the file
+    subprocess.run(["open", output_path])
+
+    # macOS notification
+    subprocess.run([
+        "osascript", "-e",
+        f'display notification "Relatório semanal gerado com sucesso!" '
+        f'with title "IMPERA - Relatório" subtitle "{output_path}"'
+    ])
+
+    print("Concluído!")
+
+
+if __name__ == "__main__":
+    main()

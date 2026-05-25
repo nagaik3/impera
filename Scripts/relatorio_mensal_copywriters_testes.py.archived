@@ -1,0 +1,412 @@
+#!/usr/bin/env python3
+"""
+Relatório Mensal de Copywriters com Testes
+Cruza criativos criados (lista COPY) com status de testes (lista GESTÃO DE TRÁFEGO)
+Gera .docx com métricas de aprovação e escala por copywriter.
+
+Uso:
+  python3 relatorio_mensal_copywriters_testes.py              # mês anterior
+  python3 relatorio_mensal_copywriters_testes.py --mes=5     # maio/2026
+  python3 relatorio_mensal_copywriters_testes.py --ano=2025 --mes=12  # dez/2025
+"""
+
+import json
+import os
+import sys
+import urllib.request
+from collections import defaultdict
+from datetime import datetime, timedelta
+import calendar
+import subprocess
+
+sys.path.insert(0, os.path.expanduser("~/Scripts"))
+from impera_utils import normalize_person_name, classify_task
+
+# === CONFIG ===
+API_TOKEN = os.environ.get("CLICKUP_API_TOKEN", "")
+LIST_COPY = "901324556390"
+LIST_TRAFEGO = "901324476398"
+OUTPUT_DIR = os.path.expanduser("~/Documents")
+FIELD_PARENT_TASK_ID = os.environ.get("CU_FIELD_PARENT_TASK_ID", "")
+
+# Statuses que indicam sucesso no teste
+SUCESSO_STATUSES = {"pré-escala", "validado", "escala", "vturb"}
+ESCALA_STATUSES = {"escala"}
+
+# Copywriters esperados
+COPYWRITERS = ["ANA", "CAROL", "CASSIO", "CRISPIM", "ELIAS", "YAN"]
+
+
+def api_get(endpoint):
+    """Chamada GET para API ClickUp."""
+    url = f"https://api.clickup.com/api/v2{endpoint}"
+    req = urllib.request.Request(url, headers={"Authorization": API_TOKEN})
+    try:
+        with urllib.request.urlopen(req) as resp:
+            return json.loads(resp.read())
+    except Exception as e:
+        print(f"❌ Erro na API: {e}")
+        return {"tasks": []}
+
+
+def fetch_all_tasks(list_id, page_limit=None):
+    """Busca todas as tarefas com paginação."""
+    tasks = []
+    page = 0
+    while True:
+        if page_limit and page >= page_limit:
+            break
+        params = f"subtasks=true&include_closed=true&page={page}"
+        data = api_get(f"/list/{list_id}/task?{params}")
+        batch = data.get("tasks", [])
+        tasks.extend(batch)
+        if data.get("last_page", True) or not batch:
+            break
+        page += 1
+    return tasks
+
+
+def get_cf_copywriter(task):
+    """Extrai o copywriter responsável da tarefa."""
+    for cf in task.get("custom_fields", []):
+        if "copywritter" in cf.get("name", "").lower():
+            opts = cf.get("type_config", {}).get("options", [])
+            val = cf.get("value")
+            if val is not None:
+                for o in opts:
+                    if o.get("orderindex") == val:
+                        return normalize_person_name(o["name"]) or "NÃO ATRIBUÍDO"
+    return "NÃO ATRIBUÍDO"
+
+
+def get_cf_parent_task_id(task):
+    """Extrai o parent_task_id da tarefa (link para tarefa na lista COPY)."""
+    for cf in task.get("custom_fields", []):
+        cf_name = cf.get("name", "").lower()
+        # Busca por nomes comuns do campo
+        if "parent" in cf_name or "pai" in cf_name or "relacionado" in cf_name:
+            val = cf.get("value")
+            if val and val.strip():
+                return val.strip()
+    return None
+
+
+def fetch_copy_tasks_by_month(year, month):
+    """Busca tarefas da lista COPY criadas no mês."""
+    print(f"  📝 Buscando criativos criados em {month}/{year}...")
+    all_tasks = fetch_all_tasks(LIST_COPY)
+
+    # Filtro por start_date no mês
+    month_start = datetime(year, month, 1, 0, 0, 0).timestamp() * 1000
+    last_day = calendar.monthrange(year, month)[1]
+    month_end = datetime(year, month, last_day, 23, 59, 59).timestamp() * 1000
+
+    filtered = []
+    for task in all_tasks:
+        sd = task.get("start_date")
+        if sd and month_start <= int(sd) <= month_end:
+            filtered.append(task)
+
+    print(f"  ✅ {len(filtered)} criativos criados em {month}/{year}")
+    return filtered
+
+
+def fetch_trafego_tasks_all():
+    """Busca TODAS as tarefas da GESTÃO DE TRÁFEGO (sem filtro de data)."""
+    print(f"  🚀 Buscando todos os testes do GESTÃO DE TRÁFEGO...")
+    tasks = fetch_all_tasks(LIST_TRAFEGO)
+    print(f"  ✅ {len(tasks)} tarefas de teste carregadas")
+    return tasks
+
+
+def normalize_creative_name(name):
+    """Normaliza nome do criativo para matching COPY ↔ TRAFEGO."""
+    # Remove versão
+    import re
+    name = re.sub(r"\[V\d+(?:-V?\d+)?\]", "", name)
+    # Remove IMG
+    name = name.replace("[IMG]", "")
+    # Remove espaços extras
+    name = " ".join(name.split())
+    return name.strip()
+
+
+def match_copy_to_trafego(copy_tasks, trafego_tasks):
+    """
+    Faz match entre tarefas COPY e TRAFEGO.
+    Prioridade:
+    1. Via parent_task_id (se disponível)
+    2. Via nome normalizado (fallback)
+    """
+    print(f"  🔗 Fazendo match COPY ↔ TRAFEGO...")
+
+    # Mapa: copy_task_id → trafego_task
+    matched = {}
+
+    # Mapa de IDs para acesso rápido
+    copy_by_id = {t["id"]: t for t in copy_tasks}
+    trafego_by_name = {}
+    for t in trafego_tasks:
+        name_norm = normalize_creative_name(t["name"])
+        if name_norm not in trafego_by_name:
+            trafego_by_name[name_norm] = []
+        trafego_by_name[name_norm].append(t)
+
+    # Primeira passagem: via parent_task_id
+    matched_via_parent = set()
+    for traf_task in trafego_tasks:
+        parent_id = get_cf_parent_task_id(traf_task)
+        if parent_id and parent_id in copy_by_id:
+            copy_id = parent_id
+            if copy_id not in matched:
+                matched[copy_id] = []
+            matched[copy_id].append(traf_task)
+            matched_via_parent.add(traf_task["id"])
+
+    print(f"    ✓ {len(matched_via_parent)} matches via parent_task_id")
+
+    # Segunda passagem: via nome normalizado (fallback)
+    matched_via_name = 0
+    for copy_task in copy_tasks:
+        if copy_task["id"] in matched:
+            continue  # Já tem parent_task_id
+
+        name_norm = normalize_creative_name(copy_task["name"])
+        if name_norm in trafego_by_name:
+            matched[copy_task["id"]] = trafego_by_name[name_norm]
+            matched_via_name += len(trafego_by_name[name_norm])
+
+    print(f"    ✓ {matched_via_name} matches via nome normalizado")
+
+    return matched
+
+
+def build_copywriter_report(copy_tasks, matched_trafego):
+    """
+    Constrói relatório por copywriter.
+    Retorna dict com métricas para cada CW.
+    """
+    print(f"  📊 Construindo relatório por copywriter...")
+
+    report = defaultdict(lambda: {
+        "criados": 0,
+        "em_teste": 0,
+        "aprovados": 0,
+        "em_escala": 0,
+        "variações": 0,
+    })
+
+    for copy_task in copy_tasks:
+        cw = get_cf_copywriter(copy_task)
+
+        # Conta criativo criado
+        cat, qtd, nicho, mercado, is_rp = classify_task(copy_task["name"])
+        report[cw]["criados"] += qtd
+
+        # Conta variações (V2+)
+        if "[V" in copy_task["name"]:
+            import re
+            v_match = re.search(r"\[V(\d+)(?:-V?(\d+))?\]", copy_task["name"])
+            if v_match:
+                v_low = int(v_match.group(1))
+                v_high = int(v_match.group(2)) if v_match.group(2) else v_low
+                if v_high > 1:  # Variações começam em V2
+                    report[cw]["variações"] += (v_high - 1)
+
+        # Se tem trafego task, conta como "em teste"
+        if copy_task["id"] in matched_trafego:
+            report[cw]["em_teste"] += 1
+
+            # Verifica statuses
+            trafego_tasks = matched_trafego[copy_task["id"]]
+            for traf in trafego_tasks:
+                status = traf.get("status", {}).get("status", "desconhecido").lower()
+
+                if status in SUCESSO_STATUSES:
+                    report[cw]["aprovados"] += 1
+
+                if status in ESCALA_STATUSES:
+                    report[cw]["em_escala"] += 1
+
+    print(f"  ✅ Relatório construído para {len(report)} copywriters")
+    return report
+
+
+def build_docx(report, month, year):
+    """Gera arquivo .docx com o relatório."""
+    from docx import Document
+    from docx.shared import Pt, Inches
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+
+    print(f"  📄 Gerando documento Word...")
+
+    doc = Document()
+    style = doc.styles["Normal"]
+    style.font.name = "Calibri"
+    style.font.size = Pt(10)
+
+    # Título
+    title = doc.add_heading(f"Relatório Mensal de Copywriters — Testes", level=1)
+    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+    # Subtítulo com mês/ano
+    month_name = calendar.month_name[month]
+    subtitle = doc.add_paragraph(f"{month_name} de {year}")
+    subtitle.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    subtitle_format = subtitle.runs[0]
+    subtitle_format.font.size = Pt(12)
+    subtitle_format.font.italic = True
+
+    doc.add_paragraph()  # Espaço
+
+    # Tabela principal: Métricas por copywriter
+    doc.add_heading("Produção e Performance por Copywriter", level=2)
+
+    headers = ["Copywriter", "Criados", "Em Teste", "Aprovados", "Em Escala",
+               "Taxa Aprov.", "Taxa Escala", "Variações"]
+
+    rows = []
+    for cw in sorted(COPYWRITERS):
+        if cw not in report:
+            continue
+
+        m = report[cw]
+        criados = m["criados"]
+        em_teste = m["em_teste"]
+        aprovados = m["aprovados"]
+        em_escala = m["em_escala"]
+        variacoes = m["variações"]
+
+        # Taxa de aprovação
+        taxa_aprov = f"{(aprovados/em_teste*100):.0f}%" if em_teste > 0 else "—"
+        # Taxa de escala
+        taxa_escala = f"{(em_escala/criados*100):.0f}%" if criados > 0 else "—"
+
+        rows.append([
+            cw,
+            str(criados),
+            str(em_teste),
+            str(aprovados),
+            str(em_escala),
+            taxa_aprov,
+            taxa_escala,
+            str(variacoes),
+        ])
+
+    # Totais
+    total_criados = sum(report[cw]["criados"] for cw in report)
+    total_em_teste = sum(report[cw]["em_teste"] for cw in report)
+    total_aprovados = sum(report[cw]["aprovados"] for cw in report)
+    total_em_escala = sum(report[cw]["em_escala"] for cw in report)
+    total_variacoes = sum(report[cw]["variações"] for cw in report)
+
+    taxa_aprov_total = f"{(total_aprovados/total_em_teste*100):.0f}%" if total_em_teste > 0 else "—"
+    taxa_escala_total = f"{(total_em_escala/total_criados*100):.0f}%" if total_criados > 0 else "—"
+
+    rows.append([
+        "TOTAL",
+        str(total_criados),
+        str(total_em_teste),
+        str(total_aprovados),
+        str(total_em_escala),
+        taxa_aprov_total,
+        taxa_escala_total,
+        str(total_variacoes),
+    ])
+
+    # Cria tabela
+    table = doc.add_table(rows=1 + len(rows), cols=len(headers))
+    table.style = "Light Grid Accent 1"
+
+    # Header
+    for i, header in enumerate(headers):
+        table.rows[0].cells[i].text = header
+
+    # Dados
+    for row_idx, row_data in enumerate(rows, start=1):
+        for col_idx, cell_data in enumerate(row_data):
+            table.rows[row_idx].cells[col_idx].text = cell_data
+            # Alinha números à direita
+            if col_idx > 0:
+                table.rows[row_idx].cells[col_idx].paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.RIGHT
+
+    # Alinha totais em negrito
+    for i in range(len(headers)):
+        table.rows[-1].cells[i].paragraphs[0].runs[0].font.bold = True
+
+    doc.add_paragraph()  # Espaço
+
+    # Rodapé
+    footer = doc.add_paragraph(
+        f"Relatório gerado automaticamente em {datetime.now().strftime('%d/%m/%Y às %H:%M')}"
+    )
+    footer.runs[0].font.size = Pt(8)
+    footer.runs[0].font.italic = True
+
+    # Salva arquivo
+    filename = f"Relatorio_Mensal_CW_Testes_{month:02d}_{year}.docx"
+    filepath = os.path.join(OUTPUT_DIR, filename)
+    doc.save(filepath)
+
+    print(f"  ✅ Documento salvo: {filepath}")
+    return filepath
+
+
+def notify_and_open(filepath):
+    """Notifica no macOS e abre o arquivo."""
+    try:
+        # Notificação
+        subprocess.run([
+            "osascript", "-e",
+            f'display notification "Relatório gerado com sucesso" with title "IMPERA"'
+        ], timeout=5)
+    except:
+        pass
+
+    try:
+        # Abre arquivo
+        subprocess.run(["open", filepath], timeout=5)
+    except:
+        pass
+
+
+def main():
+    # Parsear argumentos
+    now = datetime.now()
+    year = now.year
+    month = now.month - 1  # Mês anterior
+    if month < 1:
+        month = 12
+        year -= 1
+
+    for arg in sys.argv[1:]:
+        if arg.startswith("--ano="):
+            year = int(arg.split("=")[1])
+        elif arg.startswith("--mes="):
+            month = int(arg.split("=")[1])
+
+    print(f"\n📅 Relatório Mensal de Copywriters — Testes")
+    print(f"   Período: {month:02d}/{year}")
+    print("=" * 60)
+
+    # Fetch data
+    copy_tasks = fetch_copy_tasks_by_month(year, month)
+    trafego_tasks = fetch_trafego_tasks_all()
+
+    # Match
+    matched = match_copy_to_trafego(copy_tasks, trafego_tasks)
+
+    # Build report
+    report = build_copywriter_report(copy_tasks, matched)
+
+    # Generate docx
+    filepath = build_docx(report, month, year)
+
+    # Notify and open
+    notify_and_open(filepath)
+
+    print("\n✨ Relatório completo!\n")
+
+
+if __name__ == "__main__":
+    main()
