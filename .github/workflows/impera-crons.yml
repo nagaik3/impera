@@ -11,6 +11,7 @@ on:
 
     # ========== A CADA 10 MINUTOS ==========
     - cron: '*/10 * * * 1-6'    # Auto Envio COPY → GT seg-sáb
+    - cron: '2,12,22,32,42,52 * * * 1-6'  # Gate Finalizado (a cada 10min, offset) seg-sáb
 
     # ========== A CADA 2 HORAS ==========
     - cron: '0 */2 * * 1-6'     # Rastreador Esteira seg-sáb
@@ -330,10 +331,11 @@ jobs:
 
   gate:
     if: |
+      github.event_name == 'schedule' && github.event.schedule == '2,12,22,32,42,52 * * * 1-6' ||
       github.event_name == 'workflow_dispatch' && (github.event.inputs.task == 'all' || github.event.inputs.task == 'gate')
 
     runs-on: ubuntu-latest
-    name: ✅ Gate Finalizado
+    name: ✅ Gate Finalizado (a cada 10min)
 
     steps:
       - uses: actions/checkout@v4
