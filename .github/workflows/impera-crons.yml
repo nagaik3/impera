@@ -280,54 +280,13 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python3 Scripts/reminder_em_teste.py
 
-  rastreador:
-    if: |
-      github.event_name == 'schedule' && github.event.schedule == '0 */2 * * 1-6' ||
-      github.event_name == 'workflow_dispatch' && (github.event.inputs.task == 'all' || github.event.inputs.task == 'rastreador')
+  # NOTA: rastreador-esteira desabilitado - requer argumentos específicos
+  # rastreador:
+  #   ...
 
-    runs-on: ubuntu-latest
-    name: 🔄 Rastreador Esteira (a cada 2h)
-
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v4
-        with:
-          python-version: '3.11'
-
-      - name: Instalar dependências
-        run: pip install requests
-
-      - name: Rastrear Esteira
-        env:
-          CLICKUP_API_TOKEN: ${{ secrets.CLICKUP_API_TOKEN }}
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python3 Scripts/rastreador_esteira.py
-
-  monitor:
-    if: |
-      github.event_name == 'schedule' && github.event.schedule == '7 */6 * * 1-6' ||
-      github.event_name == 'workflow_dispatch' && (github.event.inputs.task == 'all' || github.event.inputs.task == 'monitor')
-
-    runs-on: ubuntu-latest
-    name: 📈 Monitor Nichos/Ofertas (a cada 6h)
-
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v4
-        with:
-          python-version: '3.11'
-
-      - name: Instalar dependências
-        run: pip install requests
-
-      - name: Monitorar Nichos
-        env:
-          CLICKUP_API_TOKEN: ${{ secrets.CLICKUP_API_TOKEN }}
-          REDTRACK_API_KEY: ${{ secrets.REDTRACK_API_KEY }}
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python3 Scripts/monitor_nichos_ofertas.py
+  # NOTA: monitor desabilitado - requer tratamento de rate limiting
+  # monitor:
+  #   ...
 
   gate:
     if: |
@@ -368,7 +327,7 @@ jobs:
           python-version: '3.11'
 
       - name: Instalar dependências
-        run: pip install requests python-docx
+        run: pip install requests python-docx reportlab
 
       - name: Gerar Relatório
         env:
@@ -391,7 +350,7 @@ jobs:
           python-version: '3.11'
 
       - name: Instalar dependências
-        run: pip install requests python-docx
+        run: pip install requests python-docx reportlab
 
       - name: Gerar Relatório
         env:
