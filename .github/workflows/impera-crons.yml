@@ -1,0 +1,171 @@
+name: IMPERA — Automação Completa
+
+on:
+  schedule:
+    - cron: '0 10 * * 1-6'      # Briefing 10h seg-sáb
+    - cron: '*/10 * * * 1-6'    # Auto Envio a cada 10min seg-sáb
+    - cron: '3 12 * * 0'        # Relatórios semanais domingo 12:03
+    - cron: '0 23 * * 0'        # Setorizados domingo 23:00
+    - cron: '7 9 1 * *'         # Mensais 1º do mês 09:07
+
+  workflow_dispatch:
+    inputs:
+      task:
+        description: 'Qual tarefa?'
+        required: true
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - briefing
+          - auto-envio
+          - semanal
+          - setorizados
+          - mensal
+
+jobs:
+  briefing:
+    if: |
+      github.event_name == 'schedule' && github.event.schedule == '0 10 * * 1-6' ||
+      github.event_name == 'workflow_dispatch' && (github.event.inputs.task == 'all' || github.event.inputs.task == 'briefing')
+    
+    runs-on: ubuntu-latest
+    name: 📊 Briefing Diário
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Instalar dependências
+        run: pip install requests python-docx python-telegram-bot
+
+      - name: Executar briefing
+        env:
+          CLICKUP_API_TOKEN: ${{ secrets.CLICKUP_API_TOKEN }}
+          REDTRACK_API_KEY: ${{ secrets.REDTRACK_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python3 Scripts/briefing_diario.py
+
+  auto-envio:
+    if: |
+      github.event_name == 'schedule' && github.event.schedule == '*/10 * * * 1-6' ||
+      github.event_name == 'workflow_dispatch' && (github.event.inputs.task == 'all' || github.event.inputs.task == 'auto-envio')
+    
+    runs-on: ubuntu-latest
+    name: 🚚 Auto Envio COPY → GT
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Instalar dependências
+        run: pip install requests
+
+      - name: Sincronizar tarefas
+        env:
+          CLICKUP_API_TOKEN: ${{ secrets.CLICKUP_API_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python3 Scripts/auto_envio_trafego.py --monitor
+
+  semanal:
+    if: |
+      github.event_name == 'schedule' && github.event.schedule == '3 12 * * 0' ||
+      github.event_name == 'workflow_dispatch' && (github.event.inputs.task == 'all' || github.event.inputs.task == 'semanal')
+    
+    runs-on: ubuntu-latest
+    name: 📈 Relatórios Semanais
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Instalar dependências
+        run: pip install requests python-docx
+
+      - name: Relatório Semanal
+        env:
+          CLICKUP_API_TOKEN: ${{ secrets.CLICKUP_API_TOKEN }}
+          REDTRACK_API_KEY: ${{ secrets.REDTRACK_API_KEY }}
+        run: python3 Scripts/relatorio_semanal_impera.py
+
+      - name: Relatório RedTrack
+        env:
+          CLICKUP_API_TOKEN: ${{ secrets.CLICKUP_API_TOKEN }}
+          REDTRACK_API_KEY: ${{ secrets.REDTRACK_API_KEY }}
+        run: python3 Scripts/relatorio_redtrack_impera.py
+
+  setorizados:
+    if: |
+      github.event_name == 'schedule' && github.event.schedule == '0 23 * * 0' ||
+      github.event_name == 'workflow_dispatch' && (github.event.inputs.task == 'all' || github.event.inputs.task == 'setorizados')
+    
+    runs-on: ubuntu-latest
+    name: 🎯 Relatórios Setorizados
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Instalar dependências
+        run: pip install requests python-docx
+
+      - name: Copy Report
+        env:
+          CLICKUP_API_TOKEN: ${{ secrets.CLICKUP_API_TOKEN }}
+          REDTRACK_API_KEY: ${{ secrets.REDTRACK_API_KEY }}
+        run: python3 Scripts/relatorio_copy_semanal.py
+
+      - name: Edição Report
+        env:
+          CLICKUP_API_TOKEN: ${{ secrets.CLICKUP_API_TOKEN }}
+        run: python3 Scripts/relatorio_edicao_semanal.py
+
+      - name: Tráfego Report
+        env:
+          CLICKUP_API_TOKEN: ${{ secrets.CLICKUP_API_TOKEN }}
+          REDTRACK_API_KEY: ${{ secrets.REDTRACK_API_KEY }}
+        run: python3 Scripts/relatorio_trafego_semanal.py
+
+      - name: GPDR Executiva
+        env:
+          CLICKUP_API_TOKEN: ${{ secrets.CLICKUP_API_TOKEN }}
+          REDTRACK_API_KEY: ${{ secrets.REDTRACK_API_KEY }}
+        run: python3 Scripts/relatorio_gpdr_executiva.py
+
+  mensal:
+    if: |
+      github.event_name == 'schedule' && github.event.schedule == '7 9 1 * *' ||
+      github.event_name == 'workflow_dispatch' && (github.event.inputs.task == 'all' || github.event.inputs.task == 'mensal')
+    
+    runs-on: ubuntu-latest
+    name: 📅 Relatórios Mensais
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Instalar dependências
+        run: pip install requests python-docx
+
+      - name: Arquivo Morto
+        env:
+          CLICKUP_API_TOKEN: ${{ secrets.CLICKUP_API_TOKEN }}
+        run: python3 Scripts/relatorio_mensal_arquivo_morto.py
+
+      - name: Copywriters com Testes
+        env:
+          CLICKUP_API_TOKEN: ${{ secrets.CLICKUP_API_TOKEN }}
+          REDTRACK_API_KEY: ${{ secrets.REDTRACK_API_KEY }}
+        run: python3 Scripts/relatorio_mensal_copywriters_testes.py

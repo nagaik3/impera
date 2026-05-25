@@ -1,0 +1,53 @@
+# Credenciais e secrets
+.env
+.env.local
+.impera_env
+.zshrc
+.zshrc.save
+.profile
+
+# Cache e dados sensíveis
+.cache/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# Arquivos do sistema
+.DS_Store
+.Trash/
+.CFUserTextEncoding
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log
+logs/
+*.out
+
+# Dados sensíveis
+*.key
+*.pem
+credentials.json
+secrets.json
+
+# Diretórios pessoais (não commitados)
+pessoal/
+private/
+Downloads/*.docx
+Desktop/
+Documents/
+
+# Node/npm
+node_modules/
+package-lock.json
+
+# Python
+venv/
+env/
+.pytest_cache/
+
