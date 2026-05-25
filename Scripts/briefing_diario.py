@@ -379,8 +379,8 @@ def send_to_clickup_chat(message):
     clean_msg = re.sub(r"</?[^>]+>", "", message)
 
     try:
-        url = f"https://api.clickup.com/api/v2/view/{chat_view_id}/chat"
-        data = json.dumps({"content": clean_msg}).encode()
+        url = f"https://api.clickup.com/api/v2/view/{chat_view_id}/comment"
+        data = json.dumps({"comment_text": clean_msg}).encode()
         req = Request(url, data=data, headers={
             "Authorization": CLICKUP_TOKEN,
             "Content-Type": "application/json"
@@ -484,10 +484,6 @@ def main():
 
     briefing = build_briefing()
 
-    # Save txt
-    txt_path = save_txt(briefing)
-    print(f"  Salvo em: {txt_path}")
-
     # Save Obsidian Daily Note
     obs_path = save_obsidian_daily(briefing)
     print(f"  Obsidian: {obs_path}")
@@ -497,12 +493,6 @@ def main():
         print("  ✅ Enviado para ClickUp Chat")
     else:
         print("  ⚠️ Falha no envio ClickUp Chat")
-
-    # Send Telegram
-    if send_telegram(briefing):
-        print("  ✅ Enviado via Telegram")
-    else:
-        print("  ⚠️ Falha no envio Telegram")
 
     # Print clean version
     clean = re.sub(r"</?[^>]+>", "", briefing)

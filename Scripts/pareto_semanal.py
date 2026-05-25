@@ -51,8 +51,8 @@ def extract_base(adgroup):
 
 
 def post_chat(text):
-    url = f"https://api.clickup.com/api/v2/view/{CHAT_VIEW_ID}/chat"
-    payload = json.dumps({"content": text}).encode()
+    url = f"https://api.clickup.com/api/v2/view/{CHAT_VIEW_ID}/comment"
+    payload = json.dumps({"comment_text": text}).encode()
     req = urllib.request.Request(url, data=payload, method='POST')
     req.add_header("Authorization", CLICKUP_TOKEN)
     req.add_header("Content-Type", "application/json")
