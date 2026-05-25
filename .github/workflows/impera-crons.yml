@@ -13,6 +13,9 @@ on:
     - cron: '*/10 * * * 1-6'    # Auto Envio COPY → GT seg-sáb
     - cron: '2,12,22,32,42,52 * * * 1-6'  # Gate Finalizado (a cada 10min, offset) seg-sáb
 
+    # ========== A CADA 15 MINUTOS ==========
+    - cron: '5,20,35,50 * * * 1-6'  # Automação Drive Edição seg-sáb
+
     # ========== A CADA 2 HORAS ==========
     - cron: '0 */2 * * 1-6'     # Rastreador Esteira seg-sáb
     - cron: '5 */2 * * 1-6'     # Auto Etiqueta (offset) seg-sáb
@@ -449,3 +452,25 @@ jobs:
         env:
           CLICKUP_API_TOKEN: ${{ secrets.CLICKUP_API_TOKEN }}
         run: python3 Scripts/auto_etiqueta.py
+
+  drive-edicao:
+    if: |
+      github.event_name == 'schedule' && github.event.schedule == '5,20,35,50 * * * 1-6' ||
+      github.event_name == 'workflow_dispatch' && (github.event.inputs.task == 'all' || github.event.inputs.task == 'drive-edicao')
+
+    runs-on: ubuntu-latest
+    name: 📁 Automação Drive Edição (a cada 15min)
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Instalar dependências
+        run: pip install requests google-auth-oauthlib google-auth-httplib2 google-api-python-client
+
+      - name: Criar Pastas no Drive
+        env:
+          CLICKUP_API_TOKEN: ${{ secrets.CLICKUP_API_TOKEN }}
+        run: python3 Scripts/automacao_drive_edicao.py
